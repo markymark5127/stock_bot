@@ -1,0 +1,7 @@
+alpaca-trade-api
+yfinance
+pandas
+numpy
+python-dateutil
+python-dotenv
+twilio

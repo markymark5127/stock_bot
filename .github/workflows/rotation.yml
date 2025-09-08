@@ -1,11 +1,9 @@
-name: Monthly Momentum Rotation (Alpaca Paper)
+name: Momentum Rotation
 
 on:
-  # Weekdays at ~9:15 AM New York time = 13:15 or 14:15 UTC depending on DST.
-  # GitHub Actions uses UTC; adjust if you want a different moment.
   schedule:
-    - cron: "15 14 * * 1-5"   # 14:15 UTC = 10:15 EDT / 9:15 EST approx pre-open
-  workflow_dispatch: {}        # allow manual run from the Actions tab
+    - cron: "15 14 * * 1-5"   # Weekdays ~9:15–10:15am ET (UTC-based)
+  workflow_dispatch: {}        # allow manual run
 
 jobs:
   rotate:
@@ -20,31 +18,36 @@ jobs:
       - name: Install deps
         run: |
           pip install --upgrade pip
-          pip install alpaca-trade-api yfinance pandas numpy python-dateutil python-dotenv
+          pip install -r requirements.txt
 
-      - name: Create .env for Alpaca Paper
+      - name: Create .env
         run: |
           echo "APCA_API_KEY_ID=${{ secrets.APCA_API_KEY_ID }}" >> .env
           echo "APCA_API_SECRET_KEY=${{ secrets.APCA_API_SECRET_KEY }}" >> .env
           echo "APCA_API_BASE_URL=https://paper-api.alpaca.markets" >> .env
+          # Twilio (optional) — add these secrets to enable SMS
+          if [ -n "${{ secrets.TWILIO_ACCOUNT_SID }}" ]; then
+            echo "TWILIO_ACCOUNT_SID=${{ secrets.TWILIO_ACCOUNT_SID }}" >> .env
+            echo "TWILIO_AUTH_TOKEN=${{ secrets.TWILIO_AUTH_TOKEN }}" >> .env
+            echo "TWILIO_FROM=${{ secrets.TWILIO_FROM }}" >> .env
+            echo "TWILIO_TO=${{ secrets.TWILIO_TO }}" >> .env
+          fi
 
-      # Optional: restore simple month-state so we don’t rebalance twice on the same first trading day
-      - name: Restore state cache
+      - name: Restore state
         uses: actions/cache@v4
         with:
           path: rotation_state.json
-          key: rotation-state-${{ github.run_id }}
+          key: rotation-state-${{ runner.os }}-${{ github.ref_name }}
           restore-keys: |
             rotation-state-
 
-      - name: Run monthly rotation (paper)
+      - name: Run rotation (monthly, one-shot)
         run: |
-          python stock_bot/momentum_rotation.py live --freq monthly --once
+          python momentum_rotation.py live --freq monthly --once
 
-      # Optional: save updated state
-      - name: Save state cache
+      - name: Save state
         if: always()
         uses: actions/cache@v4
         with:
           path: rotation_state.json
-          key: rotation-state-${{ github.run_id }}
+          key: rotation-state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}

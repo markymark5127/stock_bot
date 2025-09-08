@@ -15,12 +15,13 @@ try:
 except Exception:
     yf = None
 
-# ======== CONFIG ========
-UNIVERSE     = ["SPY", "QQQ", "IWM", "EFA", "EEM"]  # risk-on candidates
-RISK_OFF     = "SHY"                                # fallback
-TOP_N        = 2
-LOOKBACK_M   = [3, 6, 12]                           # blended momentum lookbacks (months)
-ABS_THRESH   = 0.0                                  # require blended > 0 else risk-off
+# ======== CONFIG (Balanced-but-spicy) ========
+# Growth tilt with some breadth; GLD as risk-off to keep some upside when stocks are weak
+UNIVERSE     = ["QQQ", "XLK", "SPY", "ARKK", "IWM"]  # high-quality growth + broad + innovation + small caps
+RISK_OFF     = "GLD"                                # less defensive than SHY; tends to help in risk-off regimes
+TOP_N        = 2                                     # diversify across top 2 winners
+LOOKBACK_M   = [1, 3, 6]                             # faster momentum; reacts quicker to reversals
+ABS_THRESH   = 0.0                                   # require blended momentum > 0 to be risk-on
 STATE_FILE   = "rotation_state.json"
 POLL_SECONDS = 60
 MIN_DOLLARS_PER_ORDER = 50
@@ -30,14 +31,14 @@ TZ = "America/New_York"
 # Alpaca feed (free default = iex)
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 
-# Optional intra-period protection (keep None to disable)
-INTRA_MONTH_STOP_PCT = None      # e.g., -0.08 exits losing legs mid-period
-PORTFOLIO_DD_STOP_PCT = None     # e.g., -0.05 moves entire portfolio to RISK_OFF
+# Optional intra-period protection (ENABLED for this profile)
+INTRA_MONTH_STOP_PCT = -0.10     # per-position stop: cut if −10% from period entry
+PORTFOLIO_DD_STOP_PCT = -0.15    # portfolio circuit breaker: move to GLD if equity −15% from period start
 
 # Backtest defaults
 BT_START = "2012-01-01"
 BT_END   = None  # today
-# ========================
+# ============================================
 
 # ---------- Utilities / State ----------
 def load_state():
@@ -114,7 +115,7 @@ def rotation_backtest(universe, risk_off, start, end, top_n, months_list, abs_th
             continue
 
         hist = prices.loc[:t0]
-        # ensure enough history (roughly)
+        # ensure enough history
         if len(hist) < 250:
             curve.append((t0, equity))
             continue
@@ -328,7 +329,7 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False):
     firsts = is_first_trading_of_month(closes.index) if freq=="monthly" else is_first_trading_of_week(closes.index)
     key_now = make_rebalance_key(now, freq)
 
-    # Optional intra-period risk checks (run daily)
+    # Intra-period risk checks (enabled)
     if (INTRA_MONTH_STOP_PCT or PORTFOLIO_DD_STOP_PCT):
         try:
             if PORTFOLIO_DD_STOP_PCT and state.get("month_start_equity"):
@@ -378,7 +379,7 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False):
         place_target_portfolio(api, {sym: alloc_each for sym in targets}, equity, allow_after_hours=ah_allowed)
         liquidate_others(api, set(targets), allow_after_hours=ah_allowed)
 
-        # record entries for optional per-position stops
+        # record entries for per-position stops
         try:
             state["month_entries"] = {sym: latest_price(api, sym) for sym in targets}
         except Exception:
@@ -407,12 +408,12 @@ def main():
     bt.add_argument("--start", default=BT_START)
     bt.add_argument("--end", default=BT_END)
     bt.add_argument("--topn", type=int, default=TOP_N)
-    bt.add_argument("--months", default="3,6,12")
+    bt.add_argument("--months", default="1,3,6")
     bt.add_argument("--abs", type=float, default=ABS_THRESH)
-    bt.add_argument("--freq", choices=["monthly","weekly"], default="monthly")
+    bt.add_argument("--freq", choices=["monthly","weekly"], default="weekly")
 
     live = sub.add_parser("live", help="Run Alpaca paper/live.")
-    live.add_argument("--freq", choices=["monthly","weekly"], default="monthly")
+    live.add_argument("--freq", choices=["monthly","weekly"], default="weekly")
     live.add_argument("--once", action="store_true", help="Run a single pass (ideal for Actions)")
     live.add_argument("--force", action="store_true", help="Run even if market is closed (for testing)")
     live.add_argument("--after-hours", action="store_true",

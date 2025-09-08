@@ -25,6 +25,7 @@ jobs:
           echo "APCA_API_KEY_ID=${{ secrets.APCA_API_KEY_ID }}" >> .env
           echo "APCA_API_SECRET_KEY=${{ secrets.APCA_API_SECRET_KEY }}" >> .env
           echo "APCA_API_BASE_URL=https://paper-api.alpaca.markets" >> .env
+          echo "ALPACA_DATA_FEED=iex" >> .env   # ✅ force free IEX feed
           # Twilio (optional) — add these secrets to enable SMS
           if [ -n "${{ secrets.TWILIO_ACCOUNT_SID }}" ]; then
             echo "TWILIO_ACCOUNT_SID=${{ secrets.TWILIO_ACCOUNT_SID }}" >> .env
@@ -43,15 +44,15 @@ jobs:
 
       - name: Run rotation (weekly, one-shot)
         run: |
-          python momentum_rotation.py live --freq weekly --once --force
-          # For weekly instead:
-          # python momentum_rotation.py live --freq weekly --once
+          python momentum_rotation.py live --freq weekly --once
+          # For monthly instead:
+          # python momentum_rotation.py live --freq monthly --once
           #
           # For off-hours testing (queue AH orders):
-          # python momentum_rotation.py live --freq monthly --once --after-hours
+          # python momentum_rotation.py live --freq weekly --once --after-hours
           #
           # Or to ignore the clock entirely (testing only):
-          # python momentum_rotation.py live --freq monthly --once --force
+          # python momentum_rotation.py live --freq weekly --once --force
 
       - name: Save state
         if: always()

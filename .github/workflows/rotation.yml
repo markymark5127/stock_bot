@@ -41,9 +41,9 @@ jobs:
           restore-keys: |
             rotation-state-
 
-      - name: Run rotation (monthly, one-shot)
+      - name: Run rotation (weekly, one-shot)
         run: |
-          python momentum_rotation.py live --freq monthly --once
+          python momentum_rotation.py live --freq weekly --once --force
           # For weekly instead:
           # python momentum_rotation.py live --freq weekly --once
           #

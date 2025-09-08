@@ -55,7 +55,6 @@ def blended_momentum(prices: pd.Series, months_list):
     for m in months_list:
         if len(prices) < 60:  # guard
             return np.nan
-        # approximate m-month lookback using DateOffset
         target_time = prices.index[-1] - pd.DateOffset(months=m)
         past_idx = prices.index.searchsorted(target_time)
         if past_idx <= 0 or past_idx >= len(prices):
@@ -172,28 +171,61 @@ def get_equity(api):
     try: return float(api.get_account().equity)
     except Exception: return 0.0
 
-def place_target_portfolio(api, targets, equity):
+def place_target_portfolio(api, targets, equity, allow_after_hours=False):
+    """
+    Place orders to roughly reach target dollar allocations.
+    If allow_after_hours==True (e.g., market closed), use LIMIT orders at last price with extended_hours=True.
+    Otherwise, use MARKET orders (RTH).
+    """
     for sym, dollars in targets.items():
         if dollars < MIN_DOLLARS_PER_ORDER: continue
         last = float(api.get_latest_trade(sym).price)
         qty_target = int(dollars // last)
         if qty_target <= 0: continue
+
         curr_qty = 0.0
         try: curr_qty = float(api.get_position(sym).qty)
         except Exception: pass
+
         delta = qty_target - curr_qty
         if abs(delta) < 1: continue
-        side = "buy" if delta > 0 else "sell"
-        api.submit_order(symbol=sym, qty=abs(int(delta)), side=side, type="market", time_in_force="day")
-        print(f"[{datetime.now()}] {side.upper()} {abs(int(delta))} {sym} @~{last:.2f}")
 
-def liquidate_others(api, keep_symbols):
+        side = "buy" if delta > 0 else "sell"
+        order_kwargs = {
+            "symbol": sym,
+            "qty": abs(int(delta)),
+            "side": side,
+            "time_in_force": "day",
+        }
+
+        if allow_after_hours:
+            order_kwargs.update({
+                "type": "limit",
+                "limit_price": round(last, 2),
+                "extended_hours": True,
+            })
+        else:
+            order_kwargs.update({"type": "market"})
+
+        api.submit_order(**order_kwargs)
+        print(f"[{datetime.now()}] {side.upper()} {abs(int(delta))} {sym} @~{last:.2f} ({'AH limit' if allow_after_hours else 'market'})")
+
+def liquidate_others(api, keep_symbols, allow_after_hours=False):
     held = list_positions(api)
     for sym, q in held.items():
         if sym not in keep_symbols and q > 0:
             try:
-                api.close_position(sym)
-                print(f"[{datetime.now()}] Closed {sym}")
+                if allow_after_hours:
+                    # Close via limit at last trade price in extended hours context
+                    last = float(api.get_latest_trade(sym).price)
+                    api.submit_order(
+                        symbol=sym, qty=int(q), side="sell",
+                        type="limit", limit_price=round(last, 2),
+                        time_in_force="day", extended_hours=True
+                    )
+                else:
+                    api.close_position(sym)
+                print(f"[{datetime.now()}] Closed {sym} ({'AH' if allow_after_hours else 'RTH'})")
             except Exception as e:
                 print("Close error:", sym, e)
 
@@ -222,13 +254,21 @@ def send_sms(msg: str):
     except Exception as e:
         print("SMS error:", e)
 
-def live_once(freq: str):
+def live_once(freq: str, force: bool=False, after_hours: bool=False):
     api   = alpaca_client()
     state = load_state()
 
+    # Clock diagnostics
     clock = api.get_clock()
-    if not clock.is_open:
-        print("Market closed. Exiting.")
+    try:
+        print(f"Alpaca clock: is_open={clock.is_open} now={clock.timestamp} next_open={clock.next_open} next_close={clock.next_close}")
+    except Exception:
+        print(f"Alpaca clock: is_open={getattr(clock, 'is_open', None)}")
+
+    market_open = bool(getattr(clock, "is_open", False))
+
+    if (not market_open) and (not force) and (not after_hours):
+        print("Market closed. Exiting (use --force or --after-hours to bypass).")
         return
 
     closes = get_daily_closes_alpaca(api, UNIVERSE + [RISK_OFF], days=800)
@@ -249,9 +289,9 @@ def live_once(freq: str):
                 if eq0 and eq:
                     dd = (eq - eq0) / eq0
                     if dd <= PORTFOLIO_DD_STOP_PCT:
-                        liquidate_others(api, keep_symbols=set([RISK_OFF]))
+                        liquidate_others(api, keep_symbols=set([RISK_OFF]), allow_after_hours=(after_hours and not market_open))
                         equity = get_equity(api)
-                        place_target_portfolio(api, {RISK_OFF: equity}, equity)
+                        place_target_portfolio(api, {RISK_OFF: equity}, equity, allow_after_hours=(after_hours and not market_open))
                         send_sms(f"PORTFOLIO STOP triggered ({dd:.2%}). Moved to {RISK_OFF}.")
 
             if INTRA_MONTH_STOP_PCT and state.get("month_entries"):
@@ -264,7 +304,15 @@ def live_once(freq: str):
                     pnl = (last - entry) / entry
                     if pnl <= INTRA_MONTH_STOP_PCT:
                         try:
-                            api.close_position(sym)
+                            if after_hours and not market_open:
+                                # queue a limit sell in extended hours
+                                api.submit_order(
+                                    symbol=sym, qty=int(qty), side="sell",
+                                    type="limit", limit_price=round(last, 2),
+                                    time_in_force="day", extended_hours=True
+                                )
+                            else:
+                                api.close_position(sym)
                             send_sms(f"STOP {sym} at {pnl:.2%} → shifting to {RISK_OFF}")
                         except Exception as e:
                             print("Stop close error:", e)
@@ -279,8 +327,9 @@ def live_once(freq: str):
 
         equity = get_equity(api)
         alloc_each = equity * MAX_PORTFOLIO_PCT_PER_TICKER
-        place_target_portfolio(api, {sym: alloc_each for sym in targets}, equity)
-        liquidate_others(api, set(targets))
+        ah_allowed = (after_hours and not market_open)
+        place_target_portfolio(api, {sym: alloc_each for sym in targets}, equity, allow_after_hours=ah_allowed)
+        liquidate_others(api, set(targets), allow_after_hours=ah_allowed)
 
         # record entries for optional per-position stops
         try:
@@ -293,11 +342,11 @@ def live_once(freq: str):
     else:
         print(f"No {freq} rebalance needed today. Exiting.")
 
-def live_loop(freq: str):
-    # Legacy daemon mode; not used by GitHub Actions. Keeps running.
+def live_loop(freq: str, force: bool=False, after_hours: bool=False):
+    # Daemon mode; not used by Actions. Keeps running.
     while True:
         try:
-            live_once(freq)
+            live_once(freq, force=force, after_hours=after_hours)
         except Exception as e:
             print("Error:", e)
         time.sleep(POLL_SECONDS)
@@ -317,7 +366,10 @@ def main():
 
     live = sub.add_parser("live", help="Run Alpaca paper/live.")
     live.add_argument("--freq", choices=["monthly","weekly"], default="monthly")
-    live.add_argument("--once", action="store_true", help="Run a single pass (ideal for GitHub Actions)")
+    live.add_argument("--once", action="store_true", help="Run a single pass (ideal for Actions)")
+    live.add_argument("--force", action="store_true", help="Run even if market is closed (for testing)")
+    live.add_argument("--after-hours", action="store_true",
+                      help="If market is closed, queue LIMIT orders eligible for extended hours")
 
     args = p.parse_args()
 
@@ -334,9 +386,9 @@ def main():
         print(f"Saved equity curve -> {out}")
     else:
         if args.once:
-            live_once(args.freq)
+            live_once(args.freq, force=args.force, after_hours=args.after_hours)
         else:
-            live_loop(args.freq)
+            live_loop(args.freq, force=args.force, after_hours=args.after_hours)
 
 if __name__ == "__main__":
     main()

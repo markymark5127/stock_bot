@@ -2,7 +2,7 @@ name: Momentum Rotation
 
 on:
   schedule:
-    - cron: "15 14 * * 1-5"   # Weekdays ~9:15–10:15am ET (UTC-based)
+    - cron: "35 14 * * 1-5"   # Weekdays 14:35 UTC ≈ 10:35 ET (market open)
   workflow_dispatch: {}        # allow manual run
 
 jobs:
@@ -43,7 +43,15 @@ jobs:
 
       - name: Run rotation (monthly, one-shot)
         run: |
-          python momentum_rotation.py live --freq monthly --once --force
+          python momentum_rotation.py live --freq monthly --once
+          # For weekly instead:
+          # python momentum_rotation.py live --freq weekly --once
+          #
+          # For off-hours testing (queue AH orders):
+          # python momentum_rotation.py live --freq monthly --once --after-hours
+          #
+          # Or to ignore the clock entirely (testing only):
+          # python momentum_rotation.py live --freq monthly --once --force
 
       - name: Save state
         if: always()

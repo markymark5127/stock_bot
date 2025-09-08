@@ -15,13 +15,12 @@ try:
 except Exception:
     yf = None
 
-# ======== CONFIG (Balanced-but-spicy) ========
-# Growth tilt with some breadth; GLD as risk-off to keep some upside when stocks are weak
-UNIVERSE     = ["QQQ", "XLK", "SPY", "ARKK", "IWM"]  # high-quality growth + broad + innovation + small caps
-RISK_OFF     = "GLD"                                # less defensive than SHY; tends to help in risk-off regimes
-TOP_N        = 2                                     # diversify across top 2 winners
-LOOKBACK_M   = [1, 3, 6]                             # faster momentum; reacts quicker to reversals
-ABS_THRESH   = 0.0                                   # require blended momentum > 0 to be risk-on
+# ======== GLOBAL DEFAULTS (will be overridden by profile) ========
+UNIVERSE     = ["SPY", "QQQ", "IWM", "EFA", "EEM"]
+RISK_OFF     = "SHY"
+TOP_N        = 2
+LOOKBACK_M   = [3, 6, 12]
+ABS_THRESH   = 0.0
 STATE_FILE   = "rotation_state.json"
 POLL_SECONDS = 60
 MIN_DOLLARS_PER_ORDER = 50
@@ -31,14 +30,62 @@ TZ = "America/New_York"
 # Alpaca feed (free default = iex)
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 
-# Optional intra-period protection (ENABLED for this profile)
-INTRA_MONTH_STOP_PCT = -0.10     # per-position stop: cut if −10% from period entry
-PORTFOLIO_DD_STOP_PCT = -0.15    # portfolio circuit breaker: move to GLD if equity −15% from period start
+# Optional intra-period protection
+INTRA_MONTH_STOP_PCT = None
+PORTFOLIO_DD_STOP_PCT = None
 
 # Backtest defaults
 BT_START = "2012-01-01"
 BT_END   = None  # today
-# ============================================
+# ================================================================
+
+# ----------------- PROFILES -----------------
+PROFILES = {
+    # Classic, slow & steady
+    "conservative": {
+        "UNIVERSE": ["SPY", "QQQ", "IWM", "EFA", "EEM"],
+        "RISK_OFF": "SHY",
+        "TOP_N": 2,
+        "LOOKBACK_M": [3, 6, 12],
+        "ABS_THRESH": 0.0,
+        "INTRA_MONTH_STOP_PCT": None,
+        "PORTFOLIO_DD_STOP_PCT": None,
+    },
+    # Your “balanced-but-spicy” setup
+    "balanced": {
+        "UNIVERSE": ["QQQ", "XLK", "SPY", "ARKK", "IWM"],
+        "RISK_OFF": "GLD",
+        "TOP_N": 2,
+        "LOOKBACK_M": [1, 3, 6],
+        "ABS_THRESH": 0.0,
+        "INTRA_MONTH_STOP_PCT": -0.10,
+        "PORTFOLIO_DD_STOP_PCT": -0.15,
+    },
+    # Max aggression (bigger upside, bigger pain)
+    "aggressive": {
+        "UNIVERSE": ["QQQ", "TQQQ", "SOXL", "ARKK", "SPY"],
+        "RISK_OFF": "GLD",
+        "TOP_N": 1,
+        "LOOKBACK_M": [1, 3],
+        "ABS_THRESH": 0.0,
+        "INTRA_MONTH_STOP_PCT": -0.12,
+        "PORTFOLIO_DD_STOP_PCT": -0.20,
+    },
+}
+
+def apply_profile(name: str):
+    """Override module-level config from a profile."""
+    if name not in PROFILES:
+        raise ValueError(f"Unknown profile '{name}'. Choose from: {', '.join(PROFILES)}")
+    cfg = PROFILES[name]
+    globals()["UNIVERSE"] = cfg["UNIVERSE"]
+    globals()["RISK_OFF"] = cfg["RISK_OFF"]
+    globals()["TOP_N"] = cfg["TOP_N"]
+    globals()["LOOKBACK_M"] = cfg["LOOKBACK_M"]
+    globals()["ABS_THRESH"] = cfg["ABS_THRESH"]
+    globals()["INTRA_MONTH_STOP_PCT"] = cfg["INTRA_MONTH_STOP_PCT"]
+    globals()["PORTFOLIO_DD_STOP_PCT"] = cfg["PORTFOLIO_DD_STOP_PCT"]
+    globals()["MAX_PORTFOLIO_PCT_PER_TICKER"] = 1.0 / globals()["TOP_N"]
 
 # ---------- Utilities / State ----------
 def load_state():
@@ -88,12 +135,11 @@ def rotation_backtest(universe, risk_off, start, end, top_n, months_list, abs_th
     prices = prices.sort_index()
     ends = period_end_indices(prices, "M" if freq == "monthly" else "W-FRI")
 
-    # Helper: last available trading day <= ts
+    # last available trading day <= ts
     def last_trading_on_or_before(ts: pd.Timestamp):
         idx = prices.index[prices.index <= ts]
         return idx.max() if len(idx) else None
 
-    # Helper: get level at ts* (on/before), averaged if multiple tickers
     def level_at(ts: pd.Timestamp, tickers):
         ts2 = last_trading_on_or_before(ts)
         if ts2 is None:
@@ -107,26 +153,21 @@ def rotation_backtest(universe, risk_off, start, end, top_n, months_list, abs_th
     equity = 10000.0
     curve = []
 
-    # Iterate over rebalance points
     for i, t_end in enumerate(ends):
-        # Use actual trading day for the period end
         t0 = last_trading_on_or_before(t_end)
         if t0 is None:
             continue
 
         hist = prices.loc[:t0]
-        # ensure enough history
         if len(hist) < 250:
             curve.append((t0, equity))
             continue
 
-        # Compute blended momentum scores
         scores = {t: blended_momentum(hist[t].dropna(), months_list) for t in universe}
         ranked = sorted(scores.items(), key=lambda kv: (kv[1] if kv[1] == kv[1] else -9e9), reverse=True)
         picks = [t for t, s in ranked if s == s and s > abs_thresh][:top_n]
         targets = picks if picks else [risk_off]
 
-        # Next period end (or last available data)
         t_next_nominal = ends[i + 1] if i < len(ends) - 1 else prices.index[-1]
         t1 = last_trading_on_or_before(t_next_nominal)
         if t1 is None or t1 <= t0:
@@ -329,7 +370,7 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False):
     firsts = is_first_trading_of_month(closes.index) if freq=="monthly" else is_first_trading_of_week(closes.index)
     key_now = make_rebalance_key(now, freq)
 
-    # Intra-period risk checks (enabled)
+    # Intra-period risk checks
     if (INTRA_MONTH_STOP_PCT or PORTFOLIO_DD_STOP_PCT):
         try:
             if PORTFOLIO_DD_STOP_PCT and state.get("month_start_equity"):
@@ -402,14 +443,16 @@ def live_loop(freq: str, force: bool=False, after_hours: bool=False):
 # ---------- CLI ----------
 def main():
     p = argparse.ArgumentParser(description="Momentum Rotation (monthly or weekly): backtest or live.")
+    p.add_argument("--profile", choices=list(PROFILES.keys()), default="balanced",
+                   help="Parameter preset: conservative | balanced | aggressive")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     bt = sub.add_parser("backtest", help="Run local backtest with yfinance.")
     bt.add_argument("--start", default=BT_START)
     bt.add_argument("--end", default=BT_END)
-    bt.add_argument("--topn", type=int, default=TOP_N)
-    bt.add_argument("--months", default="1,3,6")
-    bt.add_argument("--abs", type=float, default=ABS_THRESH)
+    bt.add_argument("--topn", type=int, default=None, help="Override TOP_N")
+    bt.add_argument("--months", default=None, help="Override lookbacks, e.g. '1,3,6'")
+    bt.add_argument("--abs", type=float, default=None, help="Override ABS_THRESH")
     bt.add_argument("--freq", choices=["monthly","weekly"], default="weekly")
 
     live = sub.add_parser("live", help="Run Alpaca paper/live.")
@@ -421,12 +464,19 @@ def main():
 
     args = p.parse_args()
 
+    # Apply profile first
+    apply_profile(args.profile)
+
+    # Optional overrides for backtest quality-of-life
     if args.cmd == "backtest":
-        months = [int(x.strip()) for x in args.months.split(",") if x.strip()]
+        months = LOOKBACK_M if args.months is None else [int(x.strip()) for x in args.months.split(",") if x.strip()]
+        topn = TOP_N if args.topn is None else int(args.topn)
+        abs_th = ABS_THRESH if args.abs is None else float(args.abs)
+
         curve, stats = rotation_backtest(UNIVERSE, RISK_OFF,
                                          start=args.start, end=args.end,
-                                         top_n=args.topn, months_list=months,
-                                         abs_thresh=args.abs, freq=args.freq)
+                                         top_n=topn, months_list=months,
+                                         abs_thresh=abs_th, freq=args.freq)
         print("Backtest Stats:")
         for k,v in stats.items(): print(f" - {k}: {v}")
         out = f"equity_{args.freq}.csv"

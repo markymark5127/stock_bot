@@ -79,46 +79,84 @@ def get_history_yf(tickers, start, end):
     return df.dropna(how="all")
 
 def period_end_indices(prices: pd.DataFrame, freq: str):
-    return prices.resample(freq).last().index  # 'M' or 'W-FRI'
+    """Return target period-end timestamps using resample ('M' or 'W-FRI')."""
+    return prices.resample(freq).last().index
 
 def rotation_backtest(universe, risk_off, start, end, top_n, months_list, abs_thresh, freq):
     prices = get_history_yf(universe + [risk_off], start, end).dropna()
-    ends = period_end_indices(prices, "M" if freq=="monthly" else "W-FRI")
+    prices = prices.sort_index()
+    ends = period_end_indices(prices, "M" if freq == "monthly" else "W-FRI")
+
+    # Helper: last available trading day <= ts
+    def last_trading_on_or_before(ts: pd.Timestamp):
+        idx = prices.index[prices.index <= ts]
+        return idx.max() if len(idx) else None
+
+    # Helper: get level at ts* (on/before), averaged if multiple tickers
+    def level_at(ts: pd.Timestamp, tickers):
+        ts2 = last_trading_on_or_before(ts)
+        if ts2 is None:
+            return np.nan
+        if isinstance(tickers, (list, tuple)):
+            s = prices.loc[ts2, tickers].dropna()
+            return float(s.mean()) if len(s) else np.nan
+        else:
+            return float(prices.loc[ts2, tickers])
 
     equity = 10000.0
     curve = []
-    for i, t_end in enumerate(ends):
-        hist = prices.loc[:t_end]
-        if len(hist) < 250:  # ensure enough history
-            curve.append((t_end, equity)); continue
 
+    # Iterate over rebalance points
+    for i, t_end in enumerate(ends):
+        # Use actual trading day for the period end
+        t0 = last_trading_on_or_before(t_end)
+        if t0 is None:
+            continue
+
+        hist = prices.loc[:t0]
+        # ensure enough history (roughly)
+        if len(hist) < 250:
+            curve.append((t0, equity))
+            continue
+
+        # Compute blended momentum scores
         scores = {t: blended_momentum(hist[t].dropna(), months_list) for t in universe}
-        ranked = sorted(scores.items(), key=lambda kv: (kv[1] if kv[1]==kv[1] else -9e9), reverse=True)
-        picks = [t for t,s in ranked if s==s and s > abs_thresh][:top_n]
+        ranked = sorted(scores.items(), key=lambda kv: (kv[1] if kv[1] == kv[1] else -9e9), reverse=True)
+        picks = [t for t, s in ranked if s == s and s > abs_thresh][:top_n]
         targets = picks if picks else [risk_off]
 
-        nxt = ends[i+1] if i < len(ends)-1 else prices.index[-1]
-        p0 = prices.loc[t_end, targets].mean() if len(targets)>1 else prices.loc[t_end, targets[0]]
-        p1 = prices.loc[nxt, targets].mean()   if len(targets)>1 else prices.loc[nxt, targets[0]]
+        # Next period end (or last available data)
+        t_next_nominal = ends[i + 1] if i < len(ends) - 1 else prices.index[-1]
+        t1 = last_trading_on_or_before(t_next_nominal)
+        if t1 is None or t1 <= t0:
+            curve.append((t0, equity))
+            continue
+
+        p0 = level_at(t0, targets)
+        p1 = level_at(t1, targets)
+        if not np.isfinite(p0) or not np.isfinite(p1) or p0 <= 0:
+            curve.append((t1, equity))
+            continue
+
         ret = float(p1 / p0 - 1.0)
         equity *= (1.0 + ret)
-        curve.append((nxt, equity))
+        curve.append((t1, equity))
 
-    curve = pd.DataFrame(curve, columns=["date","equity"]).set_index("date")
+    curve = pd.DataFrame(curve, columns=["date", "equity"]).set_index("date")
     daily = curve["equity"].pct_change().dropna()
     sharpe = float(np.sqrt(252) * (daily.mean() / (daily.std() + 1e-12))) if len(daily) else 0.0
-    max_dd = float((curve["equity"]/curve["equity"].cummax()-1).min()) if len(curve) else 0.0
+    max_dd = float((curve["equity"] / curve["equity"].cummax() - 1).min()) if len(curve) else 0.0
     stats = {
         "start": str(curve.index[0].date()) if len(curve) else start,
         "end":   str(curve.index[-1].date()) if len(curve) else (end or str(pd.Timestamp.today().date())),
         "final_equity": float(curve["equity"].iloc[-1]) if len(curve) else 10000.0,
-        "return_pct": float((curve["equity"].iloc[-1]/10000.0 - 1.0)*100) if len(curve) else 0.0,
+        "return_pct": float((curve["equity"].iloc[-1] / 10000.0 - 1.0) * 100) if len(curve) else 0.0,
         "sharpe_naive": sharpe,
         "max_drawdown": max_dd,
         "freq": freq,
         "top_n": top_n,
         "lookback_months": months_list,
-        "abs_threshold": abs_thresh
+        "abs_threshold": abs_thresh,
     }
     return curve, stats
 
@@ -184,16 +222,24 @@ def latest_price(api, sym):
     return float(api.get_latest_trade(sym, feed=ALPACA_DATA_FEED).price)
 
 def place_target_portfolio(api, targets, equity, allow_after_hours=False):
+    """
+    Place orders to roughly reach target dollar allocations.
+    If allow_after_hours==True (market closed), use LIMIT orders at last price with extended_hours=True.
+    Otherwise, use MARKET orders (RTH).
+    """
     for sym, dollars in targets.items():
         if dollars < MIN_DOLLARS_PER_ORDER: continue
         last = latest_price(api, sym)
         qty_target = int(dollars // last)
         if qty_target <= 0: continue
+
         curr_qty = 0.0
         try: curr_qty = float(api.get_position(sym).qty)
         except Exception: pass
+
         delta = qty_target - curr_qty
         if abs(delta) < 1: continue
+
         side = "buy" if delta > 0 else "sell"
         order_kwargs = {
             "symbol": sym,
@@ -201,6 +247,7 @@ def place_target_portfolio(api, targets, equity, allow_after_hours=False):
             "side": side,
             "time_in_force": "day",
         }
+
         if allow_after_hours:
             order_kwargs.update({
                 "type": "limit",
@@ -209,6 +256,7 @@ def place_target_portfolio(api, targets, equity, allow_after_hours=False):
             })
         else:
             order_kwargs.update({"type": "market"})
+
         api.submit_order(**order_kwargs)
         print(f"[{datetime.now()}] {side.upper()} {abs(int(delta))} {sym} @~{last:.2f} ({'AH limit' if allow_after_hours else 'market'})")
 
@@ -280,15 +328,57 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False):
     firsts = is_first_trading_of_month(closes.index) if freq=="monthly" else is_first_trading_of_week(closes.index)
     key_now = make_rebalance_key(now, freq)
 
+    # Optional intra-period risk checks (run daily)
+    if (INTRA_MONTH_STOP_PCT or PORTFOLIO_DD_STOP_PCT):
+        try:
+            if PORTFOLIO_DD_STOP_PCT and state.get("month_start_equity"):
+                eq0 = state["month_start_equity"]
+                eq  = get_equity(api)
+                if eq0 and eq:
+                    dd = (eq - eq0) / eq0
+                    if dd <= PORTFOLIO_DD_STOP_PCT:
+                        liquidate_others(api, keep_symbols=set([RISK_OFF]), allow_after_hours=(after_hours and not market_open))
+                        equity = get_equity(api)
+                        place_target_portfolio(api, {RISK_OFF: equity}, equity, allow_after_hours=(after_hours and not market_open))
+                        send_sms(f"PORTFOLIO STOP triggered ({dd:.2%}). Moved to {RISK_OFF}.")
+
+            if INTRA_MONTH_STOP_PCT and state.get("month_entries"):
+                held = list_positions(api)
+                for sym, qty in held.items():
+                    if sym == RISK_OFF or qty <= 0: continue
+                    entry = state["month_entries"].get(sym)
+                    if not entry: continue
+                    last = latest_price(api, sym)
+                    pnl = (last - entry) / entry
+                    if pnl <= INTRA_MONTH_STOP_PCT:
+                        try:
+                            if after_hours and not market_open:
+                                api.submit_order(
+                                    symbol=sym, qty=int(qty), side="sell",
+                                    type="limit", limit_price=round(last, 2),
+                                    time_in_force="day", extended_hours=True
+                                )
+                            else:
+                                api.close_position(sym)
+                            send_sms(f"STOP {sym} at {pnl:.2%} → shifting to {RISK_OFF}")
+                        except Exception as e:
+                            print("Stop close error:", e)
+        except Exception as e:
+            print("Intra-period check error:", e)
+
+    # Rebalance only on first trading day of the period and only once per period
     if (now in firsts) and (state.get("last_rebalance_key") != key_now):
         targets, scores = compute_picks(closes)
         print(f"[{datetime.now()}] Rebalance {freq}: picks={targets}  scores={ {k: (None if v!=v else round(v,4)) for k,v in scores.items()} }")
         send_sms(f"Rotation {freq} rebalance -> {targets}")
+
         equity = get_equity(api)
         alloc_each = equity * MAX_PORTFOLIO_PCT_PER_TICKER
         ah_allowed = (after_hours and not market_open)
         place_target_portfolio(api, {sym: alloc_each for sym in targets}, equity, allow_after_hours=ah_allowed)
         liquidate_others(api, set(targets), allow_after_hours=ah_allowed)
+
+        # record entries for optional per-position stops
         try:
             state["month_entries"] = {sym: latest_price(api, sym) for sym in targets}
         except Exception:

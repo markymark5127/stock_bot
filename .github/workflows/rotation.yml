@@ -39,7 +39,7 @@ jobs:
 
       - name: Run monthly rotation (paper)
         run: |
-          python momentum_rotation.py live
+          python stock_bot/momentum_rotation.py live --freq monthly --once
 
       # Optional: save updated state
       - name: Save state cache

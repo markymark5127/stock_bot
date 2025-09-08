@@ -43,7 +43,7 @@ jobs:
 
       - name: Run rotation (monthly, one-shot)
         run: |
-          python momentum_rotation.py live --freq monthly --once
+          python momentum_rotation.py live --freq monthly --once --force
 
       - name: Save state
         if: always()

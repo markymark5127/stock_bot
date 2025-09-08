@@ -27,6 +27,9 @@ MIN_DOLLARS_PER_ORDER = 50
 MAX_PORTFOLIO_PCT_PER_TICKER = 1.0 / TOP_N
 TZ = "America/New_York"
 
+# Alpaca feed (free default = iex)
+ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
+
 # Optional intra-period protection (keep None to disable)
 INTRA_MONTH_STOP_PCT = None      # e.g., -0.08 exits losing legs mid-period
 PORTFOLIO_DD_STOP_PCT = None     # e.g., -0.05 moves entire portfolio to RISK_OFF
@@ -134,7 +137,13 @@ def get_daily_closes_alpaca(api, tickers, days=800):
     end = datetime.now(timezone.utc); start = end - timedelta(days=days)
     frames = []
     for t in tickers:
-        bars = api.get_bars(t, TimeFrame.Day, start.isoformat(), end.isoformat()).df
+        bars = api.get_bars(
+            t,
+            TimeFrame.Day,
+            start.isoformat(),
+            end.isoformat(),
+            feed=ALPACA_DATA_FEED
+        ).df
         if bars is None or bars.empty: continue
         bars = bars.tz_convert(TZ)
         closes = bars["close"].rename(t)
@@ -171,25 +180,20 @@ def get_equity(api):
     try: return float(api.get_account().equity)
     except Exception: return 0.0
 
+def latest_price(api, sym):
+    return float(api.get_latest_trade(sym, feed=ALPACA_DATA_FEED).price)
+
 def place_target_portfolio(api, targets, equity, allow_after_hours=False):
-    """
-    Place orders to roughly reach target dollar allocations.
-    If allow_after_hours==True (e.g., market closed), use LIMIT orders at last price with extended_hours=True.
-    Otherwise, use MARKET orders (RTH).
-    """
     for sym, dollars in targets.items():
         if dollars < MIN_DOLLARS_PER_ORDER: continue
-        last = float(api.get_latest_trade(sym).price)
+        last = latest_price(api, sym)
         qty_target = int(dollars // last)
         if qty_target <= 0: continue
-
         curr_qty = 0.0
         try: curr_qty = float(api.get_position(sym).qty)
         except Exception: pass
-
         delta = qty_target - curr_qty
         if abs(delta) < 1: continue
-
         side = "buy" if delta > 0 else "sell"
         order_kwargs = {
             "symbol": sym,
@@ -197,7 +201,6 @@ def place_target_portfolio(api, targets, equity, allow_after_hours=False):
             "side": side,
             "time_in_force": "day",
         }
-
         if allow_after_hours:
             order_kwargs.update({
                 "type": "limit",
@@ -206,7 +209,6 @@ def place_target_portfolio(api, targets, equity, allow_after_hours=False):
             })
         else:
             order_kwargs.update({"type": "market"})
-
         api.submit_order(**order_kwargs)
         print(f"[{datetime.now()}] {side.upper()} {abs(int(delta))} {sym} @~{last:.2f} ({'AH limit' if allow_after_hours else 'market'})")
 
@@ -216,8 +218,7 @@ def liquidate_others(api, keep_symbols, allow_after_hours=False):
         if sym not in keep_symbols and q > 0:
             try:
                 if allow_after_hours:
-                    # Close via limit at last trade price in extended hours context
-                    last = float(api.get_latest_trade(sym).price)
+                    last = latest_price(api, sym)
                     api.submit_order(
                         symbol=sym, qty=int(q), side="sell",
                         type="limit", limit_price=round(last, 2),
@@ -239,7 +240,7 @@ def make_rebalance_key(now: pd.Timestamp, freq: str):
     if freq == "monthly": return f"M-{now.year}-{now.month:02d}"
     iso = now.isocalendar(); return f"W-{iso.year}-{int(iso.week):02d}"
 
-# Optional SMS (Twilio) — auto no-op if env not set
+# ---------- SMS (Twilio optional) ----------
 def send_sms(msg: str):
     try:
         from twilio.rest import Client
@@ -254,11 +255,11 @@ def send_sms(msg: str):
     except Exception as e:
         print("SMS error:", e)
 
+# ---------- Live once ----------
 def live_once(freq: str, force: bool=False, after_hours: bool=False):
     api   = alpaca_client()
     state = load_state()
 
-    # Clock diagnostics
     clock = api.get_clock()
     try:
         print(f"Alpaca clock: is_open={clock.is_open} now={clock.timestamp} next_open={clock.next_open} next_close={clock.next_close}")
@@ -266,7 +267,6 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False):
         print(f"Alpaca clock: is_open={getattr(clock, 'is_open', None)}")
 
     market_open = bool(getattr(clock, "is_open", False))
-
     if (not market_open) and (not force) and (not after_hours):
         print("Market closed. Exiting (use --force or --after-hours to bypass).")
         return
@@ -280,60 +280,17 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False):
     firsts = is_first_trading_of_month(closes.index) if freq=="monthly" else is_first_trading_of_week(closes.index)
     key_now = make_rebalance_key(now, freq)
 
-    # Optional intra-period risk checks (run daily)
-    if (INTRA_MONTH_STOP_PCT or PORTFOLIO_DD_STOP_PCT):
-        try:
-            if PORTFOLIO_DD_STOP_PCT and state.get("month_start_equity"):
-                eq0 = state["month_start_equity"]
-                eq  = get_equity(api)
-                if eq0 and eq:
-                    dd = (eq - eq0) / eq0
-                    if dd <= PORTFOLIO_DD_STOP_PCT:
-                        liquidate_others(api, keep_symbols=set([RISK_OFF]), allow_after_hours=(after_hours and not market_open))
-                        equity = get_equity(api)
-                        place_target_portfolio(api, {RISK_OFF: equity}, equity, allow_after_hours=(after_hours and not market_open))
-                        send_sms(f"PORTFOLIO STOP triggered ({dd:.2%}). Moved to {RISK_OFF}.")
-
-            if INTRA_MONTH_STOP_PCT and state.get("month_entries"):
-                held = list_positions(api)
-                for sym, qty in held.items():
-                    if sym == RISK_OFF or qty <= 0: continue
-                    entry = state["month_entries"].get(sym)
-                    if not entry: continue
-                    last = float(api.get_latest_trade(sym).price)
-                    pnl = (last - entry) / entry
-                    if pnl <= INTRA_MONTH_STOP_PCT:
-                        try:
-                            if after_hours and not market_open:
-                                # queue a limit sell in extended hours
-                                api.submit_order(
-                                    symbol=sym, qty=int(qty), side="sell",
-                                    type="limit", limit_price=round(last, 2),
-                                    time_in_force="day", extended_hours=True
-                                )
-                            else:
-                                api.close_position(sym)
-                            send_sms(f"STOP {sym} at {pnl:.2%} → shifting to {RISK_OFF}")
-                        except Exception as e:
-                            print("Stop close error:", e)
-        except Exception as e:
-            print("Intra-period check error:", e)
-
-    # Rebalance only on first trading day of the period and only once per period
     if (now in firsts) and (state.get("last_rebalance_key") != key_now):
         targets, scores = compute_picks(closes)
         print(f"[{datetime.now()}] Rebalance {freq}: picks={targets}  scores={ {k: (None if v!=v else round(v,4)) for k,v in scores.items()} }")
         send_sms(f"Rotation {freq} rebalance -> {targets}")
-
         equity = get_equity(api)
         alloc_each = equity * MAX_PORTFOLIO_PCT_PER_TICKER
         ah_allowed = (after_hours and not market_open)
         place_target_portfolio(api, {sym: alloc_each for sym in targets}, equity, allow_after_hours=ah_allowed)
         liquidate_others(api, set(targets), allow_after_hours=ah_allowed)
-
-        # record entries for optional per-position stops
         try:
-            state["month_entries"] = {sym: float(api.get_latest_trade(sym).price) for sym in targets}
+            state["month_entries"] = {sym: latest_price(api, sym) for sym in targets}
         except Exception:
             state["month_entries"] = {}
         state["month_start_equity"] = equity
@@ -342,8 +299,8 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False):
     else:
         print(f"No {freq} rebalance needed today. Exiting.")
 
+# ---------- Loop ----------
 def live_loop(freq: str, force: bool=False, after_hours: bool=False):
-    # Daemon mode; not used by Actions. Keeps running.
     while True:
         try:
             live_once(freq, force=force, after_hours=after_hours)

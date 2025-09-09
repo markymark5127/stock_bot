@@ -807,8 +807,18 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False, profile_nam
 
     apply_profile(chosen)
 
-    now = closes.index[-1]
-    firsts = is_first_trading_of_month(closes.index) if freq=="monthly" else is_first_trading_of_week(closes.index)
+    # --- Use today's session date (NY) for rebalance decision, not the last closed bar ---
+    ts = pd.Timestamp(getattr(clock, "timestamp", datetime.now(timezone.utc)))
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    today = ts.tz_convert(TZ).normalize()
+
+    # Build an index that includes today even if today's bar isn't closed
+    session_index = closes.index.tz_convert(TZ).normalize()
+    index_with_today = session_index.union(pd.DatetimeIndex([today]))
+
+    firsts = is_first_trading_of_month(index_with_today) if freq == "monthly" else is_first_trading_of_week(index_with_today)
+    now = today
     key_now = make_rebalance_key(now, freq)
 
     # Intra-period risk checks (if enabled by the chosen profile)
@@ -828,9 +838,11 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False, profile_nam
             if INTRA_MONTH_STOP_PCT and state.get("month_entries"):
                 held = list_positions(api)
                 for sym, qty in held.items():
-                    if sym == RISK_OFF or qty <= 0: continue
+                    if sym == RISK_OFF or qty <= 0: 
+                        continue
                     entry = state["month_entries"].get(sym)
-                    if not entry: continue
+                    if not entry: 
+                        continue
                     last = latest_price(api, sym)
                     pnl = (last - entry) / entry
                     if pnl <= INTRA_MONTH_STOP_PCT:
@@ -852,7 +864,14 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False, profile_nam
     # Rebalance only on first trading day of the period and only once per period
     if (now in firsts) and (state.get("last_rebalance_key") != key_now):
         targets, scores = compute_picks(closes)
-        print(f"[{datetime.now()}] Rebalance {freq} [{chosen}]: picks={targets}  scores=(', '.join(f"{k}: {'NA' if not np.isfinite(v) else round(v,4)}" for k,v in scores.items()))
+
+        # ---- FIXED: build the scores string safely (no nested f-strings) ----
+        nice_scores = ", ".join(
+            f"{k}: {'NA' if (v is None or not np.isfinite(v)) else round(v, 4)}"
+            for k, v in scores.items()
+        )
+        print(f"[{datetime.now()}] Rebalance {freq} [{chosen}]: picks={targets}  scores={{ {nice_scores} }}")
+
         send_sms(f"Rotation {freq} [{chosen}] rebalance -> {targets}")
 
         equity = get_equity(api)
@@ -871,6 +890,7 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False, profile_nam
         save_state(state)
     else:
         print(f"No {freq} rebalance needed today. Exiting.")
+
 
 # ---------- Loop ----------
 def live_loop(freq: str, force: bool=False, after_hours: bool=False, profile_name: str="balanced"):

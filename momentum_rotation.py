@@ -15,7 +15,7 @@ try:
 except Exception:
     yf = None
 
-# ======== GLOBAL DEFAULTS (will be overridden by profile) ========
+# ======== GLOBAL DEFAULTS (overridden by profile/apply_profile) ========
 UNIVERSE     = ["SPY", "QQQ", "IWM", "EFA", "EEM"]
 RISK_OFF     = "SHY"
 TOP_N        = 2
@@ -51,7 +51,7 @@ PROFILES = {
         "INTRA_MONTH_STOP_PCT": None,
         "PORTFOLIO_DD_STOP_PCT": None,
     },
-    # Your “balanced-but-spicy” setup
+    # Balanced-but-spicy
     "balanced": {
         "UNIVERSE": ["QQQ", "XLK", "SPY", "ARKK", "IWM"],
         "RISK_OFF": "GLD",
@@ -61,7 +61,7 @@ PROFILES = {
         "INTRA_MONTH_STOP_PCT": -0.10,
         "PORTFOLIO_DD_STOP_PCT": -0.15,
     },
-    # Max aggression (bigger upside, bigger pain)
+    # Max aggression
     "aggressive": {
         "UNIVERSE": ["QQQ", "TQQQ", "SOXL", "ARKK", "SPY"],
         "RISK_OFF": "GLD",
@@ -72,6 +72,11 @@ PROFILES = {
         "PORTFOLIO_DD_STOP_PCT": -0.20,
     },
 }
+
+# Regime thresholds & hysteresis (lean AGGRESSIVE faster)
+AUTO_HYSTERESIS = 0.002   # 0.2% buffer
+TREND_STRONG    = 0.00    # SPY ≥ SMA200 -> strong
+TREND_OK        = -0.03   # within -3% of SMA200 -> "ok"
 
 def apply_profile(name: str):
     """Override module-level config from a profile."""
@@ -85,7 +90,7 @@ def apply_profile(name: str):
     globals()["ABS_THRESH"] = cfg["ABS_THRESH"]
     globals()["INTRA_MONTH_STOP_PCT"] = cfg["INTRA_MONTH_STOP_PCT"]
     globals()["PORTFOLIO_DD_STOP_PCT"] = cfg["PORTFOLIO_DD_STOP_PCT"]
-    globals()["MAX_PORTFOLIO_PCT_PER_TICKER"] = 1.0 / globals()["TOP_N"]
+    globals()["MAX_PORTFOLIO_PCT_PER_TICKER"] = 1.0 / max(1, globals()["TOP_N"])
 
 # ---------- Utilities / State ----------
 def load_state():
@@ -95,7 +100,12 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"last_rebalance_key": "", "month_entries": {}, "month_start_equity": None}
+    return {
+        "last_rebalance_key": "",
+        "month_entries": {},
+        "month_start_equity": None,
+        "last_profile": None,   # <-- remember last chosen profile for live hysteresis
+    }
 
 def save_state(st):
     with open(STATE_FILE, "w") as f:
@@ -117,6 +127,20 @@ def blended_momentum(prices: pd.Series, months_list):
         rets.append(float(p1 / p0 - 1.0))
     return float(np.nanmean(rets))
 
+def sma(series: pd.Series, window=200):
+    s = series.dropna()
+    if len(s) < window: return np.nan
+    return float(s.tail(window).mean())
+
+def month_return(series: pd.Series, months=1):
+    s = series.dropna()
+    if s.empty: return np.nan
+    t0 = s.index[-1] - pd.DateOffset(months=months)
+    idx = s.index.searchsorted(t0)
+    if idx <= 0 or idx >= len(s): return np.nan
+    p0 = float(s.iloc[idx]); p1 = float(s.iloc[-1])
+    return (p1 / p0 - 1.0) if p0 > 0 else np.nan
+
 # ---------- BACKTEST ----------
 def get_history_yf(tickers, start, end):
     if yf is None:
@@ -127,55 +151,187 @@ def get_history_yf(tickers, start, end):
     return df.dropna(how="all")
 
 def period_end_indices(prices: pd.DataFrame, freq: str):
-    """Return target period-end timestamps using resample ('M' or 'W-FRI')."""
-    return prices.resample(freq).last().index
+    """Return target period-end timestamps using resample ('ME' month-end, 'W-FRI')."""
+    freq_norm = "ME" if freq in ("M","monthly") else ("W-FRI" if freq in ("W-FRI","weekly") else freq)
+    return prices.resample(freq_norm).last().index
 
-def rotation_backtest(universe, risk_off, start, end, top_n, months_list, abs_thresh, freq):
-    prices = get_history_yf(universe + [risk_off], start, end).dropna()
-    prices = prices.sort_index()
-    ends = period_end_indices(prices, "M" if freq == "monthly" else "W-FRI")
+def choose_profile_auto3(hist_prices: pd.DataFrame, prev_profile: str | None = None,
+                         hyst=AUTO_HYSTERESIS):
+    """
+    Decide among 'aggressive' | 'balanced' | 'conservative' using:
+      - SPY vs SMA200 (threshold 0% to lean aggressive sooner)
+      - SPY 1m/3m momentum (only one needs > 0)
+      - SMA100 slope (rising -> earlier aggression)
+      - Tech overrides (QQQ/TQQQ/SOXL)
+      - QQQ above its SMA200 can force aggressive
+      - Bear failsafe: deep below SMA200 + negative 3m => conservative
+    """
+    if "SPY" not in hist_prices.columns:
+        return "balanced", np.nan, np.nan, np.nan, np.nan
 
-    # last available trading day <= ts
-    def last_trading_on_or_before(ts: pd.Timestamp):
-        idx = prices.index[prices.index <= ts]
-        return idx.max() if len(idx) else None
+    spy = hist_prices["SPY"].dropna()
+    if spy.empty:
+        return "balanced", np.nan, np.nan, np.nan, np.nan
 
-    def level_at(ts: pd.Timestamp, tickers):
-        ts2 = last_trading_on_or_before(ts)
-        if ts2 is None:
-            return np.nan
-        if isinstance(tickers, (list, tuple)):
-            s = prices.loc[ts2, tickers].dropna()
-            return float(s.mean()) if len(s) else np.nan
+    # --- Core SPY metrics ---
+    sma200 = sma(spy, 200)
+    sma100 = sma(spy, 100)
+    last   = float(spy.iloc[-1])
+    if not np.isfinite(sma200) or sma200 <= 0:
+        return "balanced", last, sma200, np.nan, np.nan
+
+    pct_above = last / sma200 - 1.0
+    r1 = month_return(spy, 1)
+    r3 = month_return(spy, 3)
+    any_mom_pos = ((r1 is not None and r1 > 0) or (r3 is not None and r3 > 0))
+
+    # Simple SMA100 slope: last vs 5 trading days ago on SMA100 proxy
+    sma100_prev = np.nan
+    try:
+        if len(spy) >= 105:
+            sma_series = spy.rolling(100).mean()
+            sma100_prev = float(sma_series.iloc[-6])  # ~1 week earlier
+    except Exception:
+        pass
+    sma100_rising = (np.isfinite(sma100) and np.isfinite(sma100_prev) and sma100 > sma100_prev)
+
+    # --- Tech momentum overrides (looser) ---
+    override_aggr = False
+    if "QQQ" in hist_prices.columns:
+        qqq = hist_prices["QQQ"].dropna()
+        r3_qqq = month_return(qqq, 3)
+        if r3_qqq is not None and np.isfinite(r3_qqq) and r3_qqq >= 0.10:  # was 0.12
+            override_aggr = True
+
+    for lev_t in ("TQQQ", "SOXL"):
+        if lev_t in hist_prices.columns:
+            s = hist_prices[lev_t].dropna()
+            r3_lev = month_return(s, 3)
+            if r3_lev is not None and np.isfinite(r3_lev) and r3_lev >= 0.20:  # was 0.22
+                override_aggr = True
+
+    # --- QQQ SMA200 confirmation ---
+    qqq_trend_confirm = False
+    if "QQQ" in hist_prices.columns:
+        qqq = hist_prices["QQQ"].dropna()
+        qqq_sma200 = sma(qqq, 200)
+        if np.isfinite(qqq_sma200) and float(qqq.iloc[-1]) / qqq_sma200 - 1.0 > (0.0 + hyst):
+            qqq_trend_confirm = True
+
+    # --- Bear failsafe: deep below SMA200 and negative momentum ---
+    if (pct_above < (TREND_OK - 0.02)) and (r3 is not None and r3 < -0.04):
+        desired = "conservative"
+    else:
+        # --- Decision tree (aggressive earlier) ---
+        if override_aggr:
+            desired = "aggressive"
+        elif qqq_trend_confirm and any_mom_pos:
+            desired = "aggressive"
+        elif (pct_above > (TREND_STRONG + hyst) and any_mom_pos) or (sma100_rising and any_mom_pos):
+            # Either SPY ≥ SMA200 with positive momentum OR SMA100 rising with positive momentum
+            desired = "aggressive"
+        elif pct_above > (TREND_OK - hyst) and (r3 is not None and r3 >= -0.02):
+            desired = "balanced"
         else:
-            return float(prices.loc[ts2, tickers])
+            desired = "conservative"
+
+        # Hysteresis stabilization near borders
+        if prev_profile:
+            if TREND_STRONG - hyst <= pct_above <= TREND_STRONG + hyst:
+                desired = prev_profile
+            if TREND_OK - hyst <= pct_above <= TREND_OK + hyst:
+                desired = prev_profile
+
+    return desired, last, sma200, r1, r3
+
+
+def rotation_backtest(profile_name, start, end, freq,
+                      topn_override=None, months_override=None, abs_override=None):
+    """
+    Backtest with either a fixed profile or 'auto' that switches by regime
+    (aggressive/balanced/conservative).
+
+    Optional overrides:
+      - topn_override: int or None
+      - months_override: list[int] or None
+      - abs_override: float or None
+    Returns (curve, stats).
+    """
+    # Build union of tickers we may need
+    if profile_name == "auto":
+        tickers = set()
+        for p in ("aggressive", "balanced", "conservative"):
+            tickers |= set(PROFILES[p]["UNIVERSE"])
+            tickers |= {PROFILES[p]["RISK_OFF"]}
+        tickers |= {"SPY"}  # regime reference
+    else:
+        cfg = PROFILES[profile_name]
+        tickers = set(cfg["UNIVERSE"]) | {cfg["RISK_OFF"], "SPY"}
+
+    prices = get_history_yf(sorted(tickers), start, end).dropna()
+    prices = prices.sort_index()
+    ends = period_end_indices(prices, "ME" if freq == "monthly" else "W-FRI")
 
     equity = 10000.0
     curve = []
 
     for i, t_end in enumerate(ends):
-        t0 = last_trading_on_or_before(t_end)
-        if t0 is None:
+        # last trading day on/before period end
+        idx = prices.index[prices.index <= t_end]
+        if len(idx) == 0:
             continue
-
+        t0 = idx.max()
         hist = prices.loc[:t0]
+
+        # Require some history
         if len(hist) < 250:
             curve.append((t0, equity))
             continue
 
-        scores = {t: blended_momentum(hist[t].dropna(), months_list) for t in universe}
-        ranked = sorted(scores.items(), key=lambda kv: (kv[1] if kv[1] == kv[1] else -9e9), reverse=True)
-        picks = [t for t, s in ranked if s == s and s > abs_thresh][:top_n]
-        targets = picks if picks else [risk_off]
+        # Choose profile at this time
+        if profile_name == "auto":
+            chosen, last_spy, sma200, r1, r3 = choose_profile_auto3(hist, prev_profile=None)
+            cfg = PROFILES[chosen]
+        else:
+            chosen = profile_name
+            cfg = PROFILES[profile_name]
 
-        t_next_nominal = ends[i + 1] if i < len(ends) - 1 else prices.index[-1]
-        t1 = last_trading_on_or_before(t_next_nominal)
-        if t1 is None or t1 <= t0:
+        universe   = [t for t in cfg["UNIVERSE"] if t in hist.columns]
+        risk_off   = cfg["RISK_OFF"] if cfg["RISK_OFF"] in hist.columns else None
+
+        # ---- APPLY OVERRIDES (if provided) ----
+        top_n      = topn_override if topn_override is not None else cfg["TOP_N"]
+        months     = months_override if months_override is not None else cfg["LOOKBACK_M"]
+        abs_thresh = abs_override if abs_override is not None else cfg["ABS_THRESH"]
+        # --------------------------------------
+
+        if len(universe) == 0 or risk_off is None:
             curve.append((t0, equity))
             continue
 
-        p0 = level_at(t0, targets)
-        p1 = level_at(t1, targets)
+        # Compute scores in the chosen universe
+        scores = {t: blended_momentum(hist[t].dropna(), months) for t in universe}
+        ranked = sorted(scores.items(), key=lambda kv: (kv[1] if kv[1]==kv[1] else -9e9), reverse=True)
+        picks = [t for t,s in ranked if s==s and s > abs_thresh][:top_n]
+        targets = picks if picks else [risk_off]
+
+        # Next period end (or last available)
+        t_next_nominal = ends[i + 1] if i < len(ends) - 1 else prices.index[-1]
+        idx2 = prices.index[prices.index <= t_next_nominal]
+        if len(idx2) == 0 or idx2.max() <= t0:
+            curve.append((t0, equity))
+            continue
+        t1 = idx2.max()
+
+        # Price levels at t0 and t1 (average if multiple picks)
+        def lvl(ts, tickers):
+            if isinstance(tickers, (list, tuple)):
+                s = prices.loc[ts, tickers].dropna()
+                return float(s.mean()) if len(s) else np.nan
+            return float(prices.loc[ts, tickers])
+
+        p0 = lvl(t0, targets)
+        p1 = lvl(t1, targets)
         if not np.isfinite(p0) or not np.isfinite(p1) or p0 <= 0:
             curve.append((t1, equity))
             continue
@@ -196,11 +352,52 @@ def rotation_backtest(universe, risk_off, start, end, top_n, months_list, abs_th
         "sharpe_naive": sharpe,
         "max_drawdown": max_dd,
         "freq": freq,
-        "top_n": top_n,
-        "lookback_months": months_list,
-        "abs_threshold": abs_thresh,
+        "profile": profile_name,
     }
     return curve, stats
+
+def run_threshold_sweep(vals, start, end, freq):
+    """
+    Sweep TREND_STRONG over 'vals' (list of floats), run auto backtests,
+    and print/save a results table.
+    """
+    global TREND_STRONG
+    results = []
+
+    # Keep original to restore afterwards
+    original_trend_strong = TREND_STRONG
+
+    try:
+        for v in vals:
+            TREND_STRONG = float(v)
+            curve, stats = rotation_backtest(
+                "auto", start=start, end=end, freq=freq,
+                topn_override=None, months_override=None, abs_override=None
+            )
+            results.append({
+                "trend_strong": v,
+                "start": stats["start"],
+                "end": stats["end"],
+                "freq": stats["freq"],
+                "final_equity": stats["final_equity"],
+                "return_pct": stats["return_pct"],
+                "sharpe_naive": stats["sharpe_naive"],
+                "max_drawdown": stats["max_drawdown"],
+            })
+
+        df = pd.DataFrame(results)
+        df_sorted = df.sort_values(by="return_pct", ascending=False)
+        print("\n=== Threshold Sweep (TREND_STRONG) ===")
+        print(df_sorted.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+        # Save for later
+        out_csv = f"sweep_trend_strong_{freq}.csv"
+        df_sorted.to_csv(out_csv, index=False)
+        print(f"\nSaved sweep results -> {out_csv}")
+        return df_sorted
+    finally:
+        TREND_STRONG = original_trend_strong
+
 
 # ---------- LIVE ----------
 def alpaca_client():
@@ -345,8 +542,8 @@ def send_sms(msg: str):
     except Exception as e:
         print("SMS error:", e)
 
-# ---------- Live once ----------
-def live_once(freq: str, force: bool=False, after_hours: bool=False):
+# ---------- Live once with auto profile support ----------
+def live_once(freq: str, force: bool=False, after_hours: bool=False, profile_name: str="balanced"):
     api   = alpaca_client()
     state = load_state()
 
@@ -361,16 +558,40 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False):
         print("Market closed. Exiting (use --force or --after-hours to bypass).")
         return
 
-    closes = get_daily_closes_alpaca(api, UNIVERSE + [RISK_OFF], days=800)
+    # If auto, we need SPY + any universe we *might* trade today
+    if profile_name == "auto":
+        need = set()
+        for p in ("aggressive","balanced","conservative"):
+            need |= set(PROFILES[p]["UNIVERSE"]); need.add(PROFILES[p]["RISK_OFF"])
+        need.add("SPY")
+        tickers = sorted(need)
+    else:
+        tickers = sorted(set(PROFILES[profile_name]["UNIVERSE"]) | {PROFILES[profile_name]["RISK_OFF"], "SPY"})
+
+    closes = get_daily_closes_alpaca(api, tickers, days=800)
     if closes.empty:
         print("No data. Exiting.")
         return
+
+    # Decide profile (auto) or apply fixed one
+    chosen = profile_name
+    if profile_name == "auto":
+        # Use last chosen to stabilize decisions
+        prev = state.get("last_profile")
+        chosen, last_spy, sma200, r1, r3 = choose_profile_auto3(closes, prev_profile=prev)
+        print(f"[AUTO] SPY last={getattr(last_spy,'__round__',lambda x: last_spy)(2) if isinstance(last_spy,(int,float)) else last_spy} "
+              f"SMA200={getattr(sma200,'__round__',lambda x: sma200)(2) if isinstance(sma200,(int,float)) else sma200} "
+              f"r1={None if r1!=r1 else round(r1,3)} r3={None if r3!=r3 else round(r3,3)} → profile={chosen}")
+        state["last_profile"] = chosen
+        save_state(state)
+
+    apply_profile(chosen)
 
     now = closes.index[-1]
     firsts = is_first_trading_of_month(closes.index) if freq=="monthly" else is_first_trading_of_week(closes.index)
     key_now = make_rebalance_key(now, freq)
 
-    # Intra-period risk checks
+    # Intra-period risk checks (if enabled by the chosen profile)
     if (INTRA_MONTH_STOP_PCT or PORTFOLIO_DD_STOP_PCT):
         try:
             if PORTFOLIO_DD_STOP_PCT and state.get("month_start_equity"):
@@ -411,8 +632,8 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False):
     # Rebalance only on first trading day of the period and only once per period
     if (now in firsts) and (state.get("last_rebalance_key") != key_now):
         targets, scores = compute_picks(closes)
-        print(f"[{datetime.now()}] Rebalance {freq}: picks={targets}  scores={ {k: (None if v!=v else round(v,4)) for k,v in scores.items()} }")
-        send_sms(f"Rotation {freq} rebalance -> {targets}")
+        print(f"[{datetime.now()}] Rebalance {freq} [{chosen}]: picks={targets}  scores={{ {', '.join(f'{k}: {None if v!=v else round(v,4)}' for k,v in scores.items())} }}")
+        send_sms(f"Rotation {freq} [{chosen}] rebalance -> {targets}")
 
         equity = get_equity(api)
         alloc_each = equity * MAX_PORTFOLIO_PCT_PER_TICKER
@@ -432,10 +653,10 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False):
         print(f"No {freq} rebalance needed today. Exiting.")
 
 # ---------- Loop ----------
-def live_loop(freq: str, force: bool=False, after_hours: bool=False):
+def live_loop(freq: str, force: bool=False, after_hours: bool=False, profile_name: str="balanced"):
     while True:
         try:
-            live_once(freq, force=force, after_hours=after_hours)
+            live_once(freq, force=force, after_hours=after_hours, profile_name=profile_name)
         except Exception as e:
             print("Error:", e)
         time.sleep(POLL_SECONDS)
@@ -443,8 +664,8 @@ def live_loop(freq: str, force: bool=False, after_hours: bool=False):
 # ---------- CLI ----------
 def main():
     p = argparse.ArgumentParser(description="Momentum Rotation (monthly or weekly): backtest or live.")
-    p.add_argument("--profile", choices=list(PROFILES.keys()), default="balanced",
-                   help="Parameter preset: conservative | balanced | aggressive")
+    p.add_argument("--profile", choices=list(PROFILES.keys()) + ["auto"], default="balanced",
+                   help="Parameter preset: conservative | balanced | aggressive | auto (auto-switches among the three)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     bt = sub.add_parser("backtest", help="Run local backtest with yfinance.")
@@ -462,31 +683,63 @@ def main():
     live.add_argument("--after-hours", action="store_true",
                       help="If market is closed, queue LIMIT orders eligible for extended hours")
 
+    sweep = sub.add_parser("sweep", help="Sweep TREND_STRONG thresholds and compare performance.")
+    sweep.add_argument("--start", default=BT_START)
+    sweep.add_argument("--end", default=BT_END)
+    sweep.add_argument("--freq", choices=["monthly","weekly"], default="monthly")
+    sweep.add_argument("--vals", default="0,0.02,0.03,0.05",
+                       help="Comma separated list of TREND_STRONG values to test (e.g., '0,0.02,0.03,0.05')")
+
     args = p.parse_args()
 
-    # Apply profile first
-    apply_profile(args.profile)
+    # ---------- SWEEP ----------
+    if args.cmd == "sweep":
+        vals = [float(x.strip()) for x in args.vals.split(",") if x.strip()]
+        run_threshold_sweep(vals, start=args.start, end=args.end, freq=args.freq)
+        return
 
-    # Optional overrides for backtest quality-of-life
+    # ---------- BACKTEST ----------
     if args.cmd == "backtest":
-        months = LOOKBACK_M if args.months is None else [int(x.strip()) for x in args.months.split(",") if x.strip()]
-        topn = TOP_N if args.topn is None else int(args.topn)
-        abs_th = ABS_THRESH if args.abs is None else float(args.abs)
+        # Parse overrides once for backtests
+        months_override = None
+        if args.months is not None:
+            months_override = [int(x.strip()) for x in args.months.split(",") if x.strip()]
+        topn_override = args.topn if args.topn is not None else None
+        abs_override = float(args.abs) if args.abs is not None else None
 
-        curve, stats = rotation_backtest(UNIVERSE, RISK_OFF,
-                                         start=args.start, end=args.end,
-                                         top_n=topn, months_list=months,
-                                         abs_thresh=abs_th, freq=args.freq)
+        if args.profile == "auto":
+            # Auto uses function-level overrides (does NOT mutate globals)
+            curve, stats = rotation_backtest(
+                "auto", start=args.start, end=args.end, freq=args.freq,
+                topn_override=topn_override, months_override=months_override, abs_override=abs_override
+            )
+        else:
+            # Keep old behavior for non-auto: mutate globals, then call
+            apply_profile(args.profile)
+            if args.topn is not None:
+                globals()["TOP_N"] = int(args.topn)
+                globals()["MAX_PORTFOLIO_PCT_PER_TICKER"] = 1.0 / max(1, TOP_N)
+            if args.months is not None:
+                globals()["LOOKBACK_M"] = [int(x.strip()) for x in args.months.split(",") if x.strip()]
+            if args.abs is not None:
+                globals()["ABS_THRESH"] = float(args.abs)
+
+            curve, stats = rotation_backtest(args.profile, start=args.start, end=args.end, freq=args.freq)
+
         print("Backtest Stats:")
-        for k,v in stats.items(): print(f" - {k}: {v}")
+        for k, v in stats.items():
+            print(f" - {k}: {v}")
         out = f"equity_{args.freq}.csv"
         curve.to_csv(out)
         print(f"Saved equity curve -> {out}")
-    else:
+        return
+
+    # ---------- LIVE ----------
+    if args.cmd == "live":
         if args.once:
-            live_once(args.freq, force=args.force, after_hours=args.after_hours)
+            live_once(args.freq, force=args.force, after_hours=args.after_hours, profile_name=args.profile)
         else:
-            live_loop(args.freq, force=args.force, after_hours=args.after_hours)
+            live_loop(args.freq, force=args.force, after_hours=args.after_hours, profile_name=args.profile)
 
 if __name__ == "__main__":
     main()

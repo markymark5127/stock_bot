@@ -1,62 +1,82 @@
 name: Momentum Rotation
 
 on:
+  # Weekdays at 14:35 UTC (≈ 10:35 ET during DST, 09:35 ET in winter)
   schedule:
-    - cron: "35 14 * * 1-5"   # Weekdays 14:35 UTC ≈ 10:35 ET (market open)
-  workflow_dispatch: {}        # allow manual run
+    - cron: "35 14 * * 1-5"
+  workflow_dispatch: {}  # allow manual run
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rotation-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rotate:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
 
       - name: Install deps
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip wheel setuptools
           pip install -r requirements.txt
 
       - name: Create .env
         run: |
-          echo "APCA_API_KEY_ID=${{ secrets.APCA_API_KEY_ID }}" >> .env
-          echo "APCA_API_SECRET_KEY=${{ secrets.APCA_API_SECRET_KEY }}" >> .env
-          echo "APCA_API_BASE_URL=https://paper-api.alpaca.markets" >> .env
-          echo "ALPACA_DATA_FEED=iex" >> .env   # ✅ force free IEX feed
-          # Twilio (optional) — add these secrets to enable SMS
-          if [ -n "${{ secrets.TWILIO_ACCOUNT_SID }}" ]; then
-            echo "TWILIO_ACCOUNT_SID=${{ secrets.TWILIO_ACCOUNT_SID }}" >> .env
-            echo "TWILIO_AUTH_TOKEN=${{ secrets.TWILIO_AUTH_TOKEN }}" >> .env
-            echo "TWILIO_FROM=${{ secrets.TWILIO_FROM }}" >> .env
-            echo "TWILIO_TO=${{ secrets.TWILIO_TO }}" >> .env
-          fi
+          {
+            echo "APCA_API_KEY_ID=${{ secrets.APCA_API_KEY_ID }}";
+            echo "APCA_API_SECRET_KEY=${{ secrets.APCA_API_SECRET_KEY }}";
+            echo "APCA_API_BASE_URL=https://paper-api.alpaca.markets";
+            echo "ALPACA_DATA_FEED=iex";  # force free IEX feed
+            # Twilio (optional)
+            if [ -n "${{ secrets.TWILIO_ACCOUNT_SID }}" ]; then
+              echo "TWILIO_ACCOUNT_SID=${{ secrets.TWILIO_ACCOUNT_SID }}";
+              echo "TWILIO_AUTH_TOKEN=${{ secrets.TWILIO_AUTH_TOKEN }}";
+              echo "TWILIO_FROM=${{ secrets.TWILIO_FROM }}";
+              echo "TWILIO_TO=${{ secrets.TWILIO_TO }}";
+            fi
+          } >> .env
 
+      # Restore persistent state between runs
       - name: Restore state
-        uses: actions/cache@v4
+        id: cache-restore
+        uses: actions/cache/restore@v4
         with:
           path: rotation_state.json
           key: rotation-state-${{ runner.os }}-${{ github.ref_name }}
           restore-keys: |
-            rotation-state-
+            rotation-state-${{ runner.os }}-${{ github.ref_name }}-
 
-      - name: Run rotation (weekly, one-shot)
+      - name: Ensure state file exists
         run: |
-          python momentum_rotation.py live --freq weekly --once
+          [ -f rotation_state.json ] || echo '{}' > rotation_state.json
+
+      - name: Run rotation (weekly, one-shot, AUTO profile)
+        run: |
+          python momentum_rotation.py live --profile auto --freq weekly --once
           # For monthly instead:
-          # python momentum_rotation.py live --freq monthly --once
+          # python momentum_rotation.py live --profile auto --freq monthly --once
           #
           # For off-hours testing (queue AH orders):
-          # python momentum_rotation.py live --freq weekly --once --after-hours
+          # python momentum_rotation.py live --profile auto --freq weekly --once --after-hours
           #
-          # Or to ignore the clock entirely (testing only):
-          # python momentum_rotation.py live --freq weekly --once --force
+          # Or ignore the clock entirely (testing only):
+          # python momentum_rotation.py live --profile auto --freq weekly --once --force
 
+      # Save updated state for next run
       - name: Save state
         if: always()
-        uses: actions/cache@v4
+        uses: actions/cache/save@v4
         with:
           path: rotation_state.json
           key: rotation-state-${{ runner.os }}-${{ github.ref_name }}-${{ github.run_id }}

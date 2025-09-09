@@ -1,12 +1,8 @@
 import os, json, argparse, time
-import warnings
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-
-# Suppress numpy warnings for cleaner output
-warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy')
 
 # Optional (LIVE only)
 try:
@@ -31,16 +27,24 @@ MIN_DOLLARS_PER_ORDER = 50
 MAX_PORTFOLIO_PCT_PER_TICKER = 1.0 / TOP_N
 TZ = "America/New_York"
 
+# --- Enhancements toggles ---
+RELATIVE_MOM_BENCH = "SPY"   # None or "SPY"
+SKIP_MONTH = True            # use 12-1 momentum if True (skip most recent month)
+VOL_TARGET_ANNUAL = 0.12     # set None to disable vol targeting
+VOL_LOOKBACK_DAYS = 20
+VOL_MAX_LEVERAGE = 1.5       # cap risky sleeve scaling
+REBALANCE_BAND = 0.10        # 10% band; set 0 to disable
+COST_BPS = 5                 # per-trade cost in basis points (e.g., 5 = 0.05%)
+
+# Risk-off basket (best-of at each rebalance if multiple given)
+RISK_OFF_BASKET = ["BIL", "SHY", "IEF"]   # override/augment profile RISK_OFF
+
 # Alpaca feed (free default = iex)
 ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 
 # Optional intra-period protection
 INTRA_MONTH_STOP_PCT = None
 PORTFOLIO_DD_STOP_PCT = None
-
-# Enhanced risk management
-ENABLE_VOLATILITY_SIZING = True  # Size positions based on volatility
-VOLATILITY_LOOKBACK = 60         # Days for volatility calculation
 
 # Backtest defaults
 BT_START = "2012-01-01"
@@ -49,16 +53,6 @@ BT_END   = None  # today
 
 # ----------------- PROFILES -----------------
 PROFILES = {
-    # S&P 500 focused - better tracking
-    "spy_focused": {
-        "UNIVERSE": ["SPY", "VTI", "IVV", "QQQ", "XLK"],
-        "RISK_OFF": "SHY",
-        "TOP_N": 2,
-        "LOOKBACK_M": [3, 6, 12],
-        "ABS_THRESH": 0.0,
-        "INTRA_MONTH_STOP_PCT": None,
-        "PORTFOLIO_DD_STOP_PCT": None,
-    },
     # Classic, slow & steady
     "conservative": {
         "UNIVERSE": ["SPY", "QQQ", "IWM", "EFA", "EEM"],
@@ -71,7 +65,7 @@ PROFILES = {
     },
     # Balanced-but-spicy
     "balanced": {
-        "UNIVERSE": ["SPY", "QQQ", "XLK", "IWM", "EFA"],
+        "UNIVERSE": ["QQQ", "XLK", "SPY", "ARKK", "IWM"],
         "RISK_OFF": "GLD",
         "TOP_N": 2,
         "LOOKBACK_M": [1, 3, 6],
@@ -81,7 +75,7 @@ PROFILES = {
     },
     # Max aggression
     "aggressive": {
-        "UNIVERSE": ["SPY", "QQQ", "TQQQ", "SOXL", "XLK"],
+        "UNIVERSE": ["QQQ", "TQQQ", "SOXL", "ARKK", "SPY"],
         "RISK_OFF": "GLD",
         "TOP_N": 1,
         "LOOKBACK_M": [1, 3],
@@ -95,13 +89,6 @@ PROFILES = {
 AUTO_HYSTERESIS = 0.002   # 0.2% buffer
 TREND_STRONG    = 0.00    # SPY ≥ SMA200 -> strong
 TREND_OK        = -0.03   # within -3% of SMA200 -> "ok"
-
-# Control flags for isolating decision gates during sweeps
-ENABLE_SMA100_SHORTCUT = True
-ENABLE_TECH_OVERRIDES  = True
-
-# Momentum calculation method
-USE_ENHANCED_MOMENTUM = True  # Use enhanced momentum calculation vs simple blended
 
 def apply_profile(name: str):
     """Override module-level config from a profile."""
@@ -129,106 +116,77 @@ def load_state():
         "last_rebalance_key": "",
         "month_entries": {},
         "month_start_equity": None,
-        "last_profile": None,   # <-- remember last chosen profile for live hysteresis
+        "last_profile": None,   # remember last chosen profile for live hysteresis
     }
 
 def save_state(st):
     with open(STATE_FILE, "w") as f:
         json.dump(st, f, indent=2)
 
-def blended_momentum(prices: pd.Series, months_list):
-    rets = []
-    for m in months_list:
-        if len(prices) < 60:  # guard
-            return np.nan
-        target_time = prices.index[-1] - pd.DateOffset(months=m)
-        past_idx = prices.index.searchsorted(target_time)
-        if past_idx <= 0 or past_idx >= len(prices):
-            return np.nan
-        p0 = prices.iloc[past_idx]
-        p1 = prices.iloc[-1]
-        if p0 <= 0:
-            return np.nan
-        rets.append(float(p1 / p0 - 1.0))
+# ---------- Helpers for returns & benchmark ----------
+def equal_weight_period_return(prices: pd.DataFrame, tickers, t0, t1) -> float:
+    """Equal-weight return between t0 and t1 over the specified tickers."""
+    ticks = [t for t in tickers if t in prices.columns]
+    if not ticks:
+        return np.nan
+    p0 = prices.loc[t0, ticks].astype(float)
+    p1 = prices.loc[t1, ticks].astype(float)
+    p0 = p0[p0 > 0].dropna()
+    p1 = p1[p1 > 0].dropna()
+    common = p0.index.intersection(p1.index)
+    if len(common) == 0:
+        return np.nan
+    rets = (p1[common] / p0[common] - 1.0).values
     return float(np.nanmean(rets))
 
-def enhanced_momentum(prices: pd.Series, months_list, volatility_lookback=60):
-    """
-    Enhanced momentum calculation that considers:
-    1. Multiple timeframes (like original)
-    2. Volatility-adjusted returns (Sharpe-like)
-    3. Recent momentum strength
-    """
-    if len(prices) < max(months_list) * 30:
+def buy_and_hold_curve(prices: pd.Series, start_equity=10000.0) -> pd.DataFrame:
+    """Buy & hold curve for a single series (e.g., SPY)."""
+    s = prices.dropna().astype(float)
+    if s.empty:
+        return pd.DataFrame(columns=["equity"])
+    base = float(s.iloc[0])
+    eq = start_equity * (s / base)
+    return eq.to_frame("equity")
+
+def series_sharpe_dd(curve: pd.DataFrame, freq: str):
+    """Naive Sharpe annualized by period frequency ('monthly' or 'weekly'); also max DD."""
+    if curve.empty or "equity" not in curve:
+        return 0.0, 0.0
+    period_rets = curve["equity"].pct_change().dropna()
+    if not len(period_rets):
+        return 0.0, 0.0
+    ann_k = np.sqrt(12) if freq == "monthly" else (np.sqrt(52) if freq == "weekly" else np.sqrt(252))
+    sharpe = float(ann_k * (period_rets.mean() / (period_rets.std() + 1e-12)))
+    max_dd = float((curve["equity"] / curve["equity"].cummax() - 1).min())
+    return sharpe, max_dd
+
+def blended_momentum(prices: pd.Series, months_list, skip_month=SKIP_MONTH):
+    if not months_list:
+        return np.nan
+    max_m = max(months_list) + (1 if skip_month else 0)
+    min_needed = 22 * max_m + 5
+    s = prices.dropna()
+    if len(s) < min_needed:
         return np.nan
 
-    # Build (m, mom) pairs
-    mom_pairs = []
-    for m in months_list:
-        target_time = prices.index[-1] - pd.DateOffset(months=m)
-        past_idx = prices.index.searchsorted(target_time)
-        if 0 < past_idx < len(prices):
-            p0 = prices.iloc[past_idx]
-            p1 = prices.iloc[-1]
-            if p0 > 0:
-                mom_pairs.append((m, float(p1 / p0 - 1.0)))
+    def ret_months(m):
+        # if skip_month: we measure from (m+1) months ago to 1 month ago
+        if skip_month:
+            end_t = s.index[-1] - pd.DateOffset(months=1)
+            start_t = s.index[-1] - pd.DateOffset(months=m+1)
+        else:
+            end_t = s.index[-1]
+            start_t = s.index[-1] - pd.DateOffset(months=m)
+        i0 = s.index.searchsorted(start_t)
+        i1 = s.index.searchsorted(end_t)
+        if i0 <= 0 or i1 <= 0 or i0 >= len(s) or i1 >= len(s) or i1 <= i0:
+            return np.nan
+        p0, p1 = float(s.iloc[i0]), float(s.iloc[i1])
+        return (p1 / p0 - 1.0) if p0 > 0 else np.nan
 
-    if not mom_pairs:
-        return np.nan
-
-    raw_vals = [v for _, v in mom_pairs]
-    avg_momentum = float(np.nanmean(raw_vals))
-
-    # Volatility
-    if len(prices) < volatility_lookback:
-        return avg_momentum
-    recent_returns = prices.pct_change().dropna().tail(volatility_lookback)
-    if recent_returns.empty:
-        return avg_momentum
-    vol = recent_returns.std() * np.sqrt(252)
-
-    vol_adjusted = (avg_momentum / vol) if vol > 0 else avg_momentum
-
-    # Recent vs longer split
-    recent_vals = [v for m, v in mom_pairs if m <= 3]
-    longer_vals = [v for m, v in mom_pairs if m > 3]
-    if recent_vals and longer_vals:
-        weighted_momentum = 0.6 * np.nanmean(recent_vals) + 0.4 * np.nanmean(longer_vals)
-    elif recent_vals:
-        weighted_momentum = float(np.nanmean(recent_vals))
-    elif longer_vals:
-        weighted_momentum = float(np.nanmean(longer_vals))
-    else:
-        weighted_momentum = avg_momentum
-
-    return float(0.7 * vol_adjusted + 0.3 * weighted_momentum)
-
-def calculate_volatility_adjusted_size(prices: pd.Series, base_size: float, lookback: int = 60):
-    """
-    Calculate position size based on volatility.
-    Higher volatility = smaller position size.
-    """
-    if len(prices) < lookback:
-        return base_size
-    
-    recent_returns = prices.pct_change().dropna().tail(lookback)
-    if len(recent_returns) == 0:
-        return base_size
-        
-    volatility = recent_returns.std() * np.sqrt(252)  # Annualized
-    
-    if volatility <= 0 or np.isnan(volatility):
-        return base_size
-    
-    # Target volatility of 15% annualized
-    target_vol = 0.15
-    vol_adjustment = min(target_vol / volatility, 1.0)  # Cap at 1.0
-    
-    # Apply minimum size of 50% of base size
-    adjusted_size = max(base_size * vol_adjustment, base_size * 0.5)
-    
-    return adjusted_size
-
+    rets = [ret_months(m) for m in months_list]
+    rets = [r for r in rets if np.isfinite(r)]
+    return float(np.nanmean(rets)) if rets else np.nan
 
 def sma(series: pd.Series, window=200):
     s = series.dropna()
@@ -243,51 +201,6 @@ def month_return(series: pd.Series, months=1):
     if idx <= 0 or idx >= len(s): return np.nan
     p0 = float(s.iloc[idx]); p1 = float(s.iloc[-1])
     return (p1 / p0 - 1.0) if p0 > 0 else np.nan
-
-def calculate_benchmark_metrics(strategy_returns: pd.Series, benchmark_returns: pd.Series, ppy: int):
-    aligned = pd.DataFrame({'strategy': strategy_returns, 'benchmark': benchmark_returns}).dropna()
-    if aligned.empty: return {}
-
-    s = aligned['strategy']; b = aligned['benchmark']
-
-    # Total returns
-    strategy_total_ret  = (1 + s).prod() - 1
-    benchmark_total_ret = (1 + b).prod() - 1
-
-    # Annualized (geometric via log returns at the same cadence)
-    s_log = np.log1p(s); b_log = np.log1p(b)
-    strategy_ann_ret  = float(np.expm1(s_log.mean() * ppy))
-    benchmark_ann_ret = float(np.expm1(b_log.mean() * ppy))
-
-    strategy_ann_vol  = float(s.std() * np.sqrt(ppy))
-    benchmark_ann_vol = float(b.std() * np.sqrt(ppy))
-
-    excess = s - b
-    tracking_error = float(excess.std() * np.sqrt(ppy))
-
-    # Beta/alpha
-    beta = float(np.cov(s, b)[0,1] / np.var(b)) if len(aligned) > 2 and np.var(b) > 0 else np.nan
-    rf = 0.02
-    alpha = float(strategy_ann_ret - (rf + beta * (benchmark_ann_ret - rf))) if np.isfinite(beta) else np.nan
-
-    strategy_sharpe  = float((strategy_ann_ret - rf) / strategy_ann_vol) if strategy_ann_vol > 0 else np.nan
-    benchmark_sharpe = float((benchmark_ann_ret - rf) / benchmark_ann_vol) if benchmark_ann_vol > 0 else np.nan
-    information_ratio = float((strategy_ann_ret - benchmark_ann_ret) / tracking_error) if tracking_error > 0 else np.nan
-    win_rate = float((excess > 0).mean())
-
-    return dict(
-        strategy_total_return=strategy_total_ret,
-        benchmark_total_return=benchmark_total_ret,
-        excess_return=strategy_total_ret - benchmark_total_ret,
-        strategy_annualized_return=strategy_ann_ret,
-        benchmark_annualized_return=benchmark_ann_ret,
-        strategy_annualized_volatility=strategy_ann_vol,
-        benchmark_annualized_volatility=benchmark_ann_vol,
-        alpha=alpha, beta=beta, tracking_error=tracking_error,
-        information_ratio=information_ratio,
-        strategy_sharpe=strategy_sharpe, benchmark_sharpe=benchmark_sharpe,
-        win_rate=win_rate
-    )
 
 # ---------- BACKTEST ----------
 def get_history_yf(tickers, start, end):
@@ -307,12 +220,12 @@ def choose_profile_auto3(hist_prices: pd.DataFrame, prev_profile: str | None = N
                          hyst=AUTO_HYSTERESIS):
     """
     Decide among 'aggressive' | 'balanced' | 'conservative' using:
-      - SPY vs SMA200 (threshold 0% to lean aggressive sooner)
-      - SPY 1m/3m momentum (only one needs > 0)
-      - SMA100 slope (rising -> earlier aggression)
+      - SPY vs SMA200
+      - SPY 1m/3m momentum (any positive)
+      - SMA100 slope
       - Tech overrides (QQQ/TQQQ/SOXL)
-      - QQQ above its SMA200 can force aggressive
-      - Bear failsafe: deep below SMA200 + negative 3m => conservative
+      - QQQ above its SMA200 confirmation
+      - Bear failsafe
     """
     if "SPY" not in hist_prices.columns:
         return "balanced", np.nan, np.nan, np.nan, np.nan
@@ -321,7 +234,6 @@ def choose_profile_auto3(hist_prices: pd.DataFrame, prev_profile: str | None = N
     if spy.empty:
         return "balanced", np.nan, np.nan, np.nan, np.nan
 
-    # --- Core SPY metrics ---
     sma200 = sma(spy, 200)
     sma100 = sma(spy, 100)
     last   = float(spy.iloc[-1])
@@ -331,55 +243,53 @@ def choose_profile_auto3(hist_prices: pd.DataFrame, prev_profile: str | None = N
     pct_above = last / sma200 - 1.0
     r1 = month_return(spy, 1)
     r3 = month_return(spy, 3)
-    any_mom_pos = ((r1 is not None and r1 > 0) or (r3 is not None and r3 > 0))
+    any_mom_pos = (np.isfinite(r1) and r1 > 0) or (np.isfinite(r3) and r3 > 0)
 
-    # Simple SMA100 slope: last vs 5 trading days ago on SMA100 proxy
+    # Simple SMA100 slope: last vs ~1 week earlier
     sma100_prev = np.nan
     try:
         if len(spy) >= 105:
             sma_series = spy.rolling(100).mean()
-            sma100_prev = float(sma_series.iloc[-6])  # ~1 week earlier
+            sma100_prev = float(sma_series.iloc[-6])
     except Exception:
         pass
     sma100_rising = (np.isfinite(sma100) and np.isfinite(sma100_prev) and sma100 > sma100_prev)
 
-    # --- Tech momentum overrides (looser) ---
+    # Tech momentum overrides (looser)
     override_aggr = False
-    if ENABLE_TECH_OVERRIDES:
-        if "QQQ" in hist_prices.columns:
-            qqq = hist_prices["QQQ"].dropna()
-            r3_qqq = month_return(qqq, 3)
-            if r3_qqq is not None and np.isfinite(r3_qqq) and r3_qqq >= 0.10:  # was 0.12
+    if "QQQ" in hist_prices.columns:
+        qqq = hist_prices["QQQ"].dropna()
+        r3_qqq = month_return(qqq, 3)
+        if np.isfinite(r3_qqq) and r3_qqq >= 0.10:
+            override_aggr = True
+
+    for lev_t in ("TQQQ", "SOXL"):
+        if lev_t in hist_prices.columns:
+            s = hist_prices[lev_t].dropna()
+            r3_lev = month_return(s, 3)
+            if np.isfinite(r3_lev) and r3_lev >= 0.20:
                 override_aggr = True
 
-        for lev_t in ("TQQQ", "SOXL"):
-            if lev_t in hist_prices.columns:
-                s = hist_prices[lev_t].dropna()
-                r3_lev = month_return(s, 3)
-                if r3_lev is not None and np.isfinite(r3_lev) and r3_lev >= 0.20:  # was 0.22
-                    override_aggr = True
-
-    # --- QQQ SMA200 confirmation ---
+    # QQQ SMA200 confirmation
     qqq_trend_confirm = False
     if "QQQ" in hist_prices.columns:
         qqq = hist_prices["QQQ"].dropna()
         qqq_sma200 = sma(qqq, 200)
-        if np.isfinite(qqq_sma200) and float(qqq.iloc[-1]) / qqq_sma200 - 1.0 > (0.0 + hyst):
-            qqq_trend_confirm = True
+        if np.isfinite(qqq_sma200):
+            if float(qqq.iloc[-1]) / qqq_sma200 - 1.0 > (0.0 + hyst):
+                qqq_trend_confirm = True
 
-    # --- Bear failsafe: deep below SMA200 and negative momentum ---
-    if (pct_above < (TREND_OK - 0.02)) and (r3 is not None and r3 < -0.04):
+    # Bear failsafe
+    if (pct_above < (TREND_OK - 0.02)) and (np.isfinite(r3) and r3 < -0.04):
         desired = "conservative"
     else:
-        # --- Decision tree (aggressive earlier) ---
         if override_aggr:
             desired = "aggressive"
         elif qqq_trend_confirm and any_mom_pos:
             desired = "aggressive"
-        elif (pct_above > (TREND_STRONG + hyst) and any_mom_pos) or (ENABLE_SMA100_SHORTCUT and sma100_rising and any_mom_pos):
-            # Either SPY ≥ SMA200 with positive momentum OR SMA100 rising with positive momentum
+        elif (pct_above > (TREND_STRONG + hyst) and any_mom_pos) or (sma100_rising and any_mom_pos):
             desired = "aggressive"
-        elif pct_above > (TREND_OK - hyst) and (r3 is not None and r3 >= -0.02):
+        elif pct_above > (TREND_OK - hyst) and (np.isfinite(r3) and r3 >= -0.02):
             desired = "balanced"
         else:
             desired = "conservative"
@@ -412,21 +322,23 @@ def rotation_backtest(profile_name, start, end, freq,
         for p in ("aggressive", "balanced", "conservative"):
             tickers |= set(PROFILES[p]["UNIVERSE"])
             tickers |= {PROFILES[p]["RISK_OFF"]}
-        tickers |= {"SPY"}  # regime reference
+        tickers |= {"SPY"}  # regime reference & benchmark
     else:
         cfg = PROFILES[profile_name]
         tickers = set(cfg["UNIVERSE"]) | {cfg["RISK_OFF"], "SPY"}
 
+    # include risk-off basket so we can evaluate best-of
+    tickers |= set(RISK_OFF_BASKET)
+
     prices = get_history_yf(sorted(tickers), start, end).dropna()
     prices = prices.sort_index()
-    
-    # Get SPY benchmark data for comparison
-    spy_benchmark = prices["SPY"].copy() if "SPY" in prices.columns else None
     ends = period_end_indices(prices, "ME" if freq == "monthly" else "W-FRI")
 
     equity = 10000.0
     curve = []
-    profile_choices = []  # Track profile choices for debug
+
+    # track previous period's targets for bands/costs
+    prev_targets = []
 
     for i, t_end in enumerate(ends):
         # last trading day on/before period end
@@ -444,7 +356,6 @@ def rotation_backtest(profile_name, start, end, freq,
         # Choose profile at this time
         if profile_name == "auto":
             chosen, last_spy, sma200, r1, r3 = choose_profile_auto3(hist, prev_profile=None)
-            profile_choices.append(chosen)  # Track for debug
             cfg = PROFILES[chosen]
         else:
             chosen = profile_name
@@ -459,18 +370,40 @@ def rotation_backtest(profile_name, start, end, freq,
         abs_thresh = abs_override if abs_override is not None else cfg["ABS_THRESH"]
         # --------------------------------------
 
-        if len(universe) == 0 or risk_off is None:
+        if len(universe) == 0:
             curve.append((t0, equity))
             continue
 
         # Compute scores in the chosen universe
-        if USE_ENHANCED_MOMENTUM:
-            scores = {t: enhanced_momentum(hist[t].dropna(), months) for t in universe}
+        scores = {t: blended_momentum(hist[t].dropna(), months) for t in universe}
+        ranked = sorted(scores.items(), key=lambda kv: (kv[1] if np.isfinite(kv[1]) else -9e9), reverse=True)
+
+        # Relative momentum threshold vs SPY (and absolute)
+        rel_gate = -1e9
+        if RELATIVE_MOM_BENCH and RELATIVE_MOM_BENCH in hist.columns:
+            rel_gate = blended_momentum(hist[RELATIVE_MOM_BENCH].dropna(), months)
+
+        qualified = []
+        for t, s in ranked:
+            if not np.isfinite(s):
+                continue
+            if s <= abs_thresh:
+                continue
+            if RELATIVE_MOM_BENCH and np.isfinite(rel_gate) and s <= rel_gate:
+                continue
+            qualified.append((t, s))
+
+        picks = [t for t, _ in qualified[:top_n]]
+
+        # Risk-off: best-of basket if available, otherwise profile's RISK_OFF
+        risk_cands = [r for r in (RISK_OFF_BASKET + ([risk_off] if risk_off else [])) if r in hist.columns]
+        if not risk_cands:
+            targets = picks if picks else ([risk_off] if risk_off else [])
         else:
-            scores = {t: blended_momentum(hist[t].dropna(), months) for t in universe}
-        ranked = sorted(scores.items(), key=lambda kv: (kv[1] if kv[1]==kv[1] else -9e9), reverse=True)
-        picks = [t for t,s in ranked if s==s and s > abs_thresh][:top_n]
-        targets = picks if picks else [risk_off]
+            # choose best risk-off by 3m momentum
+            ro_scores = {r: month_return(hist[r].dropna(), 3) for r in risk_cands}
+            best_ro = max(ro_scores.items(), key=lambda kv: (-1e9 if not np.isfinite(kv[1]) else kv[1]))[0]
+            targets = picks if picks else [best_ro]
 
         # Next period end (or last available)
         t_next_nominal = ends[i + 1] if i < len(ends) - 1 else prices.index[-1]
@@ -480,58 +413,65 @@ def rotation_backtest(profile_name, start, end, freq,
             continue
         t1 = idx2.max()
 
-        # Price levels at t0 and t1 (average if multiple picks)
-        def lvl(ts, tickers):
-            if isinstance(tickers, (list, tuple)):
-                s = prices.loc[ts, tickers].dropna()
-                return float(s.mean()) if len(s) else np.nan
-            return float(prices.loc[ts, tickers])
+        # Rebalance band: compare set change
+        changed = set(targets) != set(prev_targets)
 
-        p0 = lvl(t0, targets)
-        p1 = lvl(t1, targets)
-        if not np.isfinite(p0) or not np.isfinite(p1) or p0 <= 0:
-            curve.append((t1, equity))
-            continue
+        # Compute risky sleeve return
+        risky_ret = equal_weight_period_return(prices, targets, t0, t1) if targets else np.nan
+        risky_ret = 0.0 if not np.isfinite(risky_ret) else float(risky_ret)
 
-        # Apply volatility-adjusted sizing if enabled
-        if ENABLE_VOLATILITY_SIZING and len(targets) > 0:
-            # Calculate average volatility of selected assets
-            total_vol_adjustment = 0
-            for ticker in targets:
-                if ticker in hist.columns:
-                    ticker_prices = hist[ticker].dropna()
-                    vol_adjustment = calculate_volatility_adjusted_size(
-                        ticker_prices, 1.0, VOLATILITY_LOOKBACK
-                    )
-                    total_vol_adjustment += vol_adjustment
-            
-            if total_vol_adjustment > 0:
-                avg_vol_adjustment = total_vol_adjustment / len(targets)
-                # Apply the adjustment to the return
-                ret = float(p1 / p0 - 1.0) * avg_vol_adjustment
-            else:
-                ret = float(p1 / p0 - 1.0)
-        else:
-            ret = float(p1 / p0 - 1.0)
-        
-        equity *= (1.0 + ret)
+        # Risk-off choice for this period (best-of again, using t0 history)
+        risk_cands = [r for r in (RISK_OFF_BASKET + ([risk_off] if risk_off else [])) if r in prices.columns]
+        ro = risk_cands[0] if risk_cands else None
+        if risk_cands and len(risk_cands) > 1:
+            hist_t0 = prices.loc[:t0]
+            ro_scores = {r: month_return(hist_t0[r].dropna(), 3) for r in risk_cands}
+            ro = max(ro_scores.items(), key=lambda kv: (-1e9 if not np.isfinite(kv[1]) else kv[1]))[0]
+        riskoff_ret = equal_weight_period_return(prices, [ro], t0, t1) if ro else 0.0
+        riskoff_ret = 0.0 if not np.isfinite(riskoff_ret) else float(riskoff_ret)
+
+        # Volatility targeting on risky sleeve
+        w_risky = 1.0
+        if VOL_TARGET_ANNUAL is not None and targets:
+            # realized vol of risky sleeve over last VOL_LOOKBACK_DAYS (equal weight)
+            look_idx = prices.index[prices.index <= t0]
+            look_idx = look_idx[-(VOL_LOOKBACK_DAYS+1):]
+            if len(look_idx) >= 2:
+                sub = prices.loc[look_idx, [t for t in targets if t in prices.columns]].dropna(axis=1, how="any")
+                if not sub.empty and sub.shape[1] > 0:
+                    sub_ret = sub.pct_change().dropna()
+                    ew_ret = sub_ret.mean(axis=1)
+                    ann_vol = float(ew_ret.std() * np.sqrt(252)) if len(ew_ret) else np.nan
+                    if np.isfinite(ann_vol) and ann_vol > 1e-8:
+                        w_risky = min(VOL_TARGET_ANNUAL / ann_vol, VOL_MAX_LEVERAGE)
+                        w_risky = max(0.0, w_risky)
+        w_risky = float(w_risky)
+        w_safe = max(0.0, 1.0 - min(1.0, w_risky))
+
+        period_ret = w_risky * risky_ret + w_safe * riskoff_ret
+
+        # Rebalance band & rough costs
+        if not (REBALANCE_BAND and not changed and abs(period_ret) < (REBALANCE_BAND / 2)):
+            legs = 2 if changed else 1
+            cost = (COST_BPS / 10000.0) * legs
+            period_ret -= cost
+
+        equity *= (1.0 + period_ret)
+        prev_targets = targets
         curve.append((t1, equity))
 
+    # --- Strategy stats
     curve = pd.DataFrame(curve, columns=["date", "equity"]).set_index("date")
-    daily = curve["equity"].pct_change().dropna()
-    sharpe = float(np.sqrt(252) * (daily.mean() / (daily.std() + 1e-12))) if len(daily) else 0.0
-    max_dd = float((curve["equity"] / curve["equity"].cummax() - 1).min()) if len(curve) else 0.0
-    
-    # Calculate benchmark metrics if SPY data is available
-    benchmark_metrics = {}
-    if spy_benchmark is not None and len(curve) > 1:
-        spy_aligned = spy_benchmark.reindex(curve.index, method='ffill').dropna()
-        if len(spy_aligned) > 1:
-            spy_ret = spy_aligned.pct_change().dropna()
-            strategy_ret = period_ret.loc[spy_ret.index]  # align just in case
-            benchmark_metrics = calculate_benchmark_metrics(strategy_ret, spy_ret, periods_per_year_from_freq(freq))
+    sharpe, max_dd = series_sharpe_dd(curve, freq=freq)
 
-    
+    # --- SPY benchmark over same window
+    if len(curve):
+        spy_series = prices["SPY"].loc[curve.index.min():curve.index.max()].dropna()
+        spy_curve = buy_and_hold_curve(spy_series, start_equity=10000.0).reindex(curve.index).ffill()
+    else:
+        spy_curve = pd.DataFrame(columns=["equity"])
+    spy_sharpe, spy_dd = series_sharpe_dd(spy_curve, freq=freq)
+
     stats = {
         "start": str(curve.index[0].date()) if len(curve) else start,
         "end":   str(curve.index[-1].date()) if len(curve) else (end or str(pd.Timestamp.today().date())),
@@ -541,12 +481,16 @@ def rotation_backtest(profile_name, start, end, freq,
         "max_drawdown": max_dd,
         "freq": freq,
         "profile": profile_name,
-        "profile_choices": profile_choices,  # Include for debug
+        # ---- Benchmark add-ons ----
+        "spy_final_equity": float(spy_curve["equity"].iloc[-1]) if len(spy_curve) else 10000.0,
+        "spy_return_pct": float((spy_curve["equity"].iloc[-1] / 10000.0 - 1.0) * 100) if len(spy_curve) else 0.0,
+        "spy_sharpe_naive": spy_sharpe,
+        "spy_max_drawdown": spy_dd,
+        "alpha_pct": (
+            float((curve["equity"].iloc[-1] - 10000.0) - (spy_curve["equity"].iloc[-1] - 10000.0)) / 100.0
+            if len(curve) and len(spy_curve) else 0.0
+        ),
     }
-    
-    # Add benchmark metrics to stats
-    stats.update(benchmark_metrics)
-    
     return curve, stats
 
 def run_threshold_sweep(vals, start, end, freq):
@@ -554,32 +498,18 @@ def run_threshold_sweep(vals, start, end, freq):
     Sweep TREND_STRONG over 'vals' (list of floats), run auto backtests,
     and print/save a results table.
     """
-    global TREND_STRONG, ENABLE_SMA100_SHORTCUT, ENABLE_TECH_OVERRIDES
+    global TREND_STRONG
     results = []
 
-    # Keep original values to restore afterwards
     original_trend_strong = TREND_STRONG
-    original_sma100 = ENABLE_SMA100_SHORTCUT
-    original_over = ENABLE_TECH_OVERRIDES
-
     try:
-        # Isolate TREND_STRONG effect by disabling other gates
-        ENABLE_SMA100_SHORTCUT = False
-        ENABLE_TECH_OVERRIDES = False
-
         for v in vals:
             TREND_STRONG = float(v)
             curve, stats = rotation_backtest(
                 "auto", start=start, end=end, freq=freq,
                 topn_override=None, months_override=None, abs_override=None
             )
-            
-            # Debug: Print profile choice counts
-            if stats["profile_choices"]:
-                choice_counts = pd.Series(stats["profile_choices"]).value_counts()
-                print(f"TREND_STRONG={v}: Profile counts: {dict(choice_counts)}")
-            
-            result_row = {
+            results.append({
                 "trend_strong": v,
                 "start": stats["start"],
                 "end": stats["end"],
@@ -588,53 +518,23 @@ def run_threshold_sweep(vals, start, end, freq):
                 "return_pct": stats["return_pct"],
                 "sharpe_naive": stats["sharpe_naive"],
                 "max_drawdown": stats["max_drawdown"],
-            }
-            
-            # Add key benchmark metrics if available
-            if "excess_return" in stats:
-                result_row.update({
-                    "excess_return": stats["excess_return"],
-                    "alpha": stats.get("alpha", np.nan),
-                    "beta": stats.get("beta", np.nan),
-                    "information_ratio": stats.get("information_ratio", np.nan),
-                    "win_rate": stats.get("win_rate", np.nan),
-                })
-            
-            results.append(result_row)
+                "spy_final_equity": stats.get("spy_final_equity"),
+                "spy_return_pct": stats.get("spy_return_pct"),
+                "alpha_pct": stats.get("alpha_pct"),
+            })
 
         df = pd.DataFrame(results)
         df_sorted = df.sort_values(by="return_pct", ascending=False)
-        print("\n=== Threshold Sweep (TREND_STRONG) - Isolated ===")
-        print("Note: SMA100 shortcut and tech overrides disabled to isolate TREND_STRONG effect")
-        
-        # Format the output nicely
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', None)
-        pd.set_option('display.max_colwidth', None)
-        
-        # Format percentage columns
-        PCT_KEYS = {"return_pct", "excess_return", "alpha", "win_rate", "tracking_error"}
-        for col in PCT_KEYS:
-            if col in df_sorted.columns:
-                df_sorted[col] = df_sorted[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "N/A")
-        
-        # Format decimal columns
-        DEC_KEYS = {"sharpe_naive", "beta", "information_ratio"}
-        for col in DEC_KEYS:
-            if col in df_sorted.columns:
-                df_sorted[col] = df_sorted[col].apply(lambda x: f"{x:.3f}" if pd.notna(x) else "N/A")
-        
-        print(df_sorted.to_string(index=False))
+        print("\n=== Threshold Sweep (TREND_STRONG) ===")
+        with pd.option_context('display.float_format', '{:.4f}'.format):
+            print(df_sorted.to_string(index=False))
 
-        # Save for later
         out_csv = f"sweep_trend_strong_{freq}.csv"
         df_sorted.to_csv(out_csv, index=False)
         print(f"\nSaved sweep results -> {out_csv}")
         return df_sorted
     finally:
         TREND_STRONG = original_trend_strong
-        ENABLE_SMA100_SHORTCUT = original_sma100
-        ENABLE_TECH_OVERRIDES = original_over
 
 
 # ---------- LIVE ----------
@@ -756,13 +656,33 @@ def liquidate_others(api, keep_symbols, allow_after_hours=False):
                 print("Close error:", sym, e)
 
 def compute_picks(closes: pd.DataFrame):
-    if USE_ENHANCED_MOMENTUM:
-        scores = {t: enhanced_momentum(closes[t].dropna(), LOOKBACK_M) for t in UNIVERSE}
+    # scores (skip-month logic already in blended_momentum)
+    scores = {t: blended_momentum(closes[t].dropna(), LOOKBACK_M) for t in UNIVERSE}
+    ranked = sorted(scores.items(), key=lambda kv: (kv[1] if np.isfinite(kv[1]) else -9e9), reverse=True)
+
+    # relative momentum gate vs SPY
+    rel_gate = -1e9
+    if RELATIVE_MOM_BENCH and RELATIVE_MOM_BENCH in closes.columns:
+        rel_gate = blended_momentum(closes[RELATIVE_MOM_BENCH].dropna(), LOOKBACK_M)
+
+    qualified = []
+    for t, s in ranked:
+        if not np.isfinite(s): continue
+        if s <= ABS_THRESH: continue
+        if RELATIVE_MOM_BENCH and np.isfinite(rel_gate) and s <= rel_gate: continue
+        qualified.append((t, s))
+
+    picks = [t for t, _ in qualified[:TOP_N]]
+
+    # best-of risk-off basket
+    risk_cands = [r for r in (RISK_OFF_BASKET + [RISK_OFF]) if r in closes.columns]
+    if risk_cands:
+        ro_scores = {r: month_return(closes[r].dropna(), 3) for r in risk_cands}
+        best_ro = max(ro_scores.items(), key=lambda kv: (-1e9 if not np.isfinite(kv[1]) else kv[1]))[0]
     else:
-        scores = {t: blended_momentum(closes[t].dropna(), LOOKBACK_M) for t in UNIVERSE}
-    ranked = sorted(scores.items(), key=lambda kv: (kv[1] if kv[1]==kv[1] else -9e9), reverse=True)
-    picks = [t for t,s in ranked if s==s and s > ABS_THRESH][:TOP_N]
-    return (picks if picks else [RISK_OFF]), scores
+        best_ro = RISK_OFF
+
+    return (picks if picks else [best_ro]), scores
 
 def make_rebalance_key(now: pd.Timestamp, freq: str):
     if freq == "monthly": return f"M-{now.year}-{now.month:02d}"
@@ -799,15 +719,18 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False, profile_nam
         print("Market closed. Exiting (use --force or --after-hours to bypass).")
         return
 
-    # If auto, we need SPY + any universe we *might* trade today
+    # Build ticker set (include risk-off basket)
     if profile_name == "auto":
         need = set()
         for p in ("aggressive","balanced","conservative"):
             need |= set(PROFILES[p]["UNIVERSE"]); need.add(PROFILES[p]["RISK_OFF"])
         need.add("SPY")
+        need |= set(RISK_OFF_BASKET)
         tickers = sorted(need)
     else:
-        tickers = sorted(set(PROFILES[profile_name]["UNIVERSE"]) | {PROFILES[profile_name]["RISK_OFF"], "SPY"})
+        tickers = sorted(set(PROFILES[profile_name]["UNIVERSE"])
+                         | {PROFILES[profile_name]["RISK_OFF"], "SPY"}
+                         | set(RISK_OFF_BASKET))
 
     closes = get_daily_closes_alpaca(api, tickers, days=800)
     if closes.empty:
@@ -815,14 +738,14 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False, profile_nam
         return
 
     # Decide profile (auto) or apply fixed one
+    def _fmt(x, nd=3):
+        return "NA" if (x is None or not np.isfinite(x)) else str(round(float(x), nd))
+
     chosen = profile_name
     if profile_name == "auto":
-        # Use last chosen to stabilize decisions
         prev = state.get("last_profile")
         chosen, last_spy, sma200, r1, r3 = choose_profile_auto3(closes, prev_profile=prev)
-        print(f"[AUTO] SPY last={getattr(last_spy,'__round__',lambda x: last_spy)(2) if isinstance(last_spy,(int,float)) else last_spy} "
-              f"SMA200={getattr(sma200,'__round__',lambda x: sma200)(2) if isinstance(sma200,(int,float)) else sma200} "
-              f"r1={None if r1!=r1 else round(r1,3)} r3={None if r3!=r3 else round(r3,3)} → profile={chosen}")
+        print(f"[AUTO] SPY last={_fmt(last_spy,2)} SMA200={_fmt(sma200,2)} r1={_fmt(r1,3)} r3={_fmt(r3,3)} → profile={chosen}")
         state["last_profile"] = chosen
         save_state(state)
 
@@ -873,7 +796,7 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False, profile_nam
     # Rebalance only on first trading day of the period and only once per period
     if (now in firsts) and (state.get("last_rebalance_key") != key_now):
         targets, scores = compute_picks(closes)
-        print(f"[{datetime.now()}] Rebalance {freq} [{chosen}]: picks={targets}  scores={{ {', '.join(f'{k}: {None if v!=v else round(v,4)}' for k,v in scores.items())} }}")
+        print(f"[{datetime.now()}] Rebalance {freq} [{chosen}]: picks={targets}  scores={{ {', '.join(f'{k}: {('NA' if not np.isfinite(v) else round(v,4))}' for k,v in scores.items())} }}")
         send_sms(f"Rotation {freq} [{chosen}] rebalance -> {targets}")
 
         equity = get_equity(api)
@@ -907,16 +830,6 @@ def main():
     p = argparse.ArgumentParser(description="Momentum Rotation (monthly or weekly): backtest or live.")
     p.add_argument("--profile", choices=list(PROFILES.keys()) + ["auto"], default="balanced",
                    help="Parameter preset: conservative | balanced | aggressive | auto (auto-switches among the three)")
-    p.add_argument("--trend-strong", type=float, default=None,
-                   help="Override TREND_STRONG (e.g., 0.03 means SPY must be 3% above SMA200 for 'strong').")
-    p.add_argument("--enhanced-momentum", action="store_true",
-                   help="Use enhanced momentum calculation (volatility-adjusted)")
-    p.add_argument("--simple-momentum", action="store_true",
-                   help="Use simple momentum calculation (original method)")
-    p.add_argument("--volatility-sizing", action="store_true",
-                   help="Enable volatility-based position sizing")
-    p.add_argument("--no-volatility-sizing", action="store_true",
-                   help="Disable volatility-based position sizing")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     bt = sub.add_parser("backtest", help="Run local backtest with yfinance.")
@@ -943,22 +856,6 @@ def main():
 
     args = p.parse_args()
 
-    # Apply trend-strong override if provided (except for sweep which uses --vals)
-    if args.trend_strong is not None and args.cmd != "sweep":
-        globals()["TREND_STRONG"] = float(args.trend_strong)
-    
-    # Apply momentum calculation override if provided
-    if args.enhanced_momentum:
-        globals()["USE_ENHANCED_MOMENTUM"] = True
-    elif args.simple_momentum:
-        globals()["USE_ENHANCED_MOMENTUM"] = False
-    
-    # Apply volatility sizing override if provided
-    if args.volatility_sizing:
-        globals()["ENABLE_VOLATILITY_SIZING"] = True
-    elif args.no_volatility_sizing:
-        globals()["ENABLE_VOLATILITY_SIZING"] = False
-
     # ---------- SWEEP ----------
     if args.cmd == "sweep":
         vals = [float(x.strip()) for x in args.vals.split(",") if x.strip()]
@@ -967,7 +864,6 @@ def main():
 
     # ---------- BACKTEST ----------
     if args.cmd == "backtest":
-        # Parse overrides once for backtests
         months_override = None
         if args.months is not None:
             months_override = [int(x.strip()) for x in args.months.split(",") if x.strip()]
@@ -975,7 +871,6 @@ def main():
         abs_override = float(args.abs) if args.abs is not None else None
 
         if args.profile == "auto":
-            # Auto uses function-level overrides (does NOT mutate globals)
             curve, stats = rotation_backtest(
                 "auto", start=args.start, end=args.end, freq=args.freq,
                 topn_override=topn_override, months_override=months_override, abs_override=abs_override
@@ -994,40 +889,18 @@ def main():
             curve, stats = rotation_backtest(args.profile, start=args.start, end=args.end, freq=args.freq)
 
         print("Backtest Stats:")
-        # Define formatting groups
-        PCT_KEYS = {"return_pct", "excess_return", "alpha", "win_rate", "tracking_error"}
-        DEC_KEYS = {"sharpe_naive", "strategy_sharpe", "benchmark_sharpe", "information_ratio", "beta"}
-        
-        for k, v in stats.items():
-            if k == "profile_choices":  # Skip debug info
-                continue
-            if isinstance(v, float):
-                if k in PCT_KEYS:
-                    print(f" - {k}: {v:.2%}")
-                elif k in DEC_KEYS:
-                    print(f" - {k}: {v:.3f}")
-                else:
-                    print(f" - {k}: {v:.2f}")
-            else:
-                print(f" - {k}: {v}")
-        
-        # Enhanced benchmark reporting
-        if "excess_return" in stats:
-            print("\n=== Benchmark Comparison (vs SPY) ===")
-            print(f"Strategy Total Return: {stats.get('strategy_total_return', 0):.2%}")
-            print(f"SPY Total Return:      {stats.get('benchmark_total_return', 0):.2%}")
-            print(f"Excess Return:         {stats.get('excess_return', 0):.2%}")
-            print(f"Alpha:                 {stats.get('alpha', 0):.2%}")
-            print(f"Beta:                  {stats.get('beta', 0):.3f}")
-            print(f"Information Ratio:     {stats.get('information_ratio', 0):.3f}")
-            print(f"Tracking Error:        {stats.get('tracking_error', 0):.2%}")
-            print(f"Win Rate:              {stats.get('win_rate', 0):.2%}")
-            print(f"Strategy Sharpe:       {stats.get('strategy_sharpe', 0):.3f}")
-            print(f"SPY Sharpe:            {stats.get('benchmark_sharpe', 0):.3f}")
-        
+        ordered_keys = [
+            "start","end","freq","profile",
+            "final_equity","return_pct","sharpe_naive","max_drawdown",
+            "spy_final_equity","spy_return_pct","spy_sharpe_naive","spy_max_drawdown",
+            "alpha_pct"
+        ]
+        for k in ordered_keys:
+            if k in stats:
+                print(f" - {k}: {stats[k]}")
         out = f"equity_{args.freq}.csv"
         curve.to_csv(out)
-        print(f"\nSaved equity curve -> {out}")
+        print(f"Saved equity curve -> {out}")
         return
 
     # ---------- LIVE ----------

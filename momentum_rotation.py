@@ -852,7 +852,7 @@ def live_once(freq: str, force: bool=False, after_hours: bool=False, profile_nam
     # Rebalance only on first trading day of the period and only once per period
     if (now in firsts) and (state.get("last_rebalance_key") != key_now):
         targets, scores = compute_picks(closes)
-        print(f"[{datetime.now()}] Rebalance {freq} [{chosen}]: picks={targets}  scores={{ {', '.join(f'{k}: {('NA' if not np.isfinite(v) else round(v,4))}' for k,v in scores.items())} }}")
+        print(f"[{datetime.now()}] Rebalance {freq} [{chosen}]: picks={targets}  scores=(', '.join(f"{k}: {'NA' if not np.isfinite(v) else round(v,4)}" for k,v in scores.items()))
         send_sms(f"Rotation {freq} [{chosen}] rebalance -> {targets}")
 
         equity = get_equity(api)

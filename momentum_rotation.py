@@ -1,8 +1,12 @@
 import os, json, argparse, time
+import warnings
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+
+# Suppress numpy warnings for cleaner output
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy')
 
 # Optional (LIVE only)
 try:
@@ -34,6 +38,10 @@ ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 INTRA_MONTH_STOP_PCT = None
 PORTFOLIO_DD_STOP_PCT = None
 
+# Enhanced risk management
+ENABLE_VOLATILITY_SIZING = True  # Size positions based on volatility
+VOLATILITY_LOOKBACK = 60         # Days for volatility calculation
+
 # Backtest defaults
 BT_START = "2012-01-01"
 BT_END   = None  # today
@@ -41,6 +49,16 @@ BT_END   = None  # today
 
 # ----------------- PROFILES -----------------
 PROFILES = {
+    # S&P 500 focused - better tracking
+    "spy_focused": {
+        "UNIVERSE": ["SPY", "VTI", "IVV", "QQQ", "XLK"],
+        "RISK_OFF": "SHY",
+        "TOP_N": 2,
+        "LOOKBACK_M": [3, 6, 12],
+        "ABS_THRESH": 0.0,
+        "INTRA_MONTH_STOP_PCT": None,
+        "PORTFOLIO_DD_STOP_PCT": None,
+    },
     # Classic, slow & steady
     "conservative": {
         "UNIVERSE": ["SPY", "QQQ", "IWM", "EFA", "EEM"],
@@ -53,7 +71,7 @@ PROFILES = {
     },
     # Balanced-but-spicy
     "balanced": {
-        "UNIVERSE": ["QQQ", "XLK", "SPY", "ARKK", "IWM"],
+        "UNIVERSE": ["SPY", "QQQ", "XLK", "IWM", "EFA"],
         "RISK_OFF": "GLD",
         "TOP_N": 2,
         "LOOKBACK_M": [1, 3, 6],
@@ -63,7 +81,7 @@ PROFILES = {
     },
     # Max aggression
     "aggressive": {
-        "UNIVERSE": ["QQQ", "TQQQ", "SOXL", "ARKK", "SPY"],
+        "UNIVERSE": ["SPY", "QQQ", "TQQQ", "SOXL", "XLK"],
         "RISK_OFF": "GLD",
         "TOP_N": 1,
         "LOOKBACK_M": [1, 3],
@@ -77,6 +95,13 @@ PROFILES = {
 AUTO_HYSTERESIS = 0.002   # 0.2% buffer
 TREND_STRONG    = 0.00    # SPY ≥ SMA200 -> strong
 TREND_OK        = -0.03   # within -3% of SMA200 -> "ok"
+
+# Control flags for isolating decision gates during sweeps
+ENABLE_SMA100_SHORTCUT = True
+ENABLE_TECH_OVERRIDES  = True
+
+# Momentum calculation method
+USE_ENHANCED_MOMENTUM = True  # Use enhanced momentum calculation vs simple blended
 
 def apply_profile(name: str):
     """Override module-level config from a profile."""
@@ -127,6 +152,84 @@ def blended_momentum(prices: pd.Series, months_list):
         rets.append(float(p1 / p0 - 1.0))
     return float(np.nanmean(rets))
 
+def enhanced_momentum(prices: pd.Series, months_list, volatility_lookback=60):
+    """
+    Enhanced momentum calculation that considers:
+    1. Multiple timeframes (like original)
+    2. Volatility-adjusted returns (Sharpe-like)
+    3. Recent momentum strength
+    """
+    if len(prices) < max(months_list) * 30:
+        return np.nan
+
+    # Build (m, mom) pairs
+    mom_pairs = []
+    for m in months_list:
+        target_time = prices.index[-1] - pd.DateOffset(months=m)
+        past_idx = prices.index.searchsorted(target_time)
+        if 0 < past_idx < len(prices):
+            p0 = prices.iloc[past_idx]
+            p1 = prices.iloc[-1]
+            if p0 > 0:
+                mom_pairs.append((m, float(p1 / p0 - 1.0)))
+
+    if not mom_pairs:
+        return np.nan
+
+    raw_vals = [v for _, v in mom_pairs]
+    avg_momentum = float(np.nanmean(raw_vals))
+
+    # Volatility
+    if len(prices) < volatility_lookback:
+        return avg_momentum
+    recent_returns = prices.pct_change().dropna().tail(volatility_lookback)
+    if recent_returns.empty:
+        return avg_momentum
+    vol = recent_returns.std() * np.sqrt(252)
+
+    vol_adjusted = (avg_momentum / vol) if vol > 0 else avg_momentum
+
+    # Recent vs longer split
+    recent_vals = [v for m, v in mom_pairs if m <= 3]
+    longer_vals = [v for m, v in mom_pairs if m > 3]
+    if recent_vals and longer_vals:
+        weighted_momentum = 0.6 * np.nanmean(recent_vals) + 0.4 * np.nanmean(longer_vals)
+    elif recent_vals:
+        weighted_momentum = float(np.nanmean(recent_vals))
+    elif longer_vals:
+        weighted_momentum = float(np.nanmean(longer_vals))
+    else:
+        weighted_momentum = avg_momentum
+
+    return float(0.7 * vol_adjusted + 0.3 * weighted_momentum)
+
+def calculate_volatility_adjusted_size(prices: pd.Series, base_size: float, lookback: int = 60):
+    """
+    Calculate position size based on volatility.
+    Higher volatility = smaller position size.
+    """
+    if len(prices) < lookback:
+        return base_size
+    
+    recent_returns = prices.pct_change().dropna().tail(lookback)
+    if len(recent_returns) == 0:
+        return base_size
+        
+    volatility = recent_returns.std() * np.sqrt(252)  # Annualized
+    
+    if volatility <= 0 or np.isnan(volatility):
+        return base_size
+    
+    # Target volatility of 15% annualized
+    target_vol = 0.15
+    vol_adjustment = min(target_vol / volatility, 1.0)  # Cap at 1.0
+    
+    # Apply minimum size of 50% of base size
+    adjusted_size = max(base_size * vol_adjustment, base_size * 0.5)
+    
+    return adjusted_size
+
+
 def sma(series: pd.Series, window=200):
     s = series.dropna()
     if len(s) < window: return np.nan
@@ -140,6 +243,51 @@ def month_return(series: pd.Series, months=1):
     if idx <= 0 or idx >= len(s): return np.nan
     p0 = float(s.iloc[idx]); p1 = float(s.iloc[-1])
     return (p1 / p0 - 1.0) if p0 > 0 else np.nan
+
+def calculate_benchmark_metrics(strategy_returns: pd.Series, benchmark_returns: pd.Series, ppy: int):
+    aligned = pd.DataFrame({'strategy': strategy_returns, 'benchmark': benchmark_returns}).dropna()
+    if aligned.empty: return {}
+
+    s = aligned['strategy']; b = aligned['benchmark']
+
+    # Total returns
+    strategy_total_ret  = (1 + s).prod() - 1
+    benchmark_total_ret = (1 + b).prod() - 1
+
+    # Annualized (geometric via log returns at the same cadence)
+    s_log = np.log1p(s); b_log = np.log1p(b)
+    strategy_ann_ret  = float(np.expm1(s_log.mean() * ppy))
+    benchmark_ann_ret = float(np.expm1(b_log.mean() * ppy))
+
+    strategy_ann_vol  = float(s.std() * np.sqrt(ppy))
+    benchmark_ann_vol = float(b.std() * np.sqrt(ppy))
+
+    excess = s - b
+    tracking_error = float(excess.std() * np.sqrt(ppy))
+
+    # Beta/alpha
+    beta = float(np.cov(s, b)[0,1] / np.var(b)) if len(aligned) > 2 and np.var(b) > 0 else np.nan
+    rf = 0.02
+    alpha = float(strategy_ann_ret - (rf + beta * (benchmark_ann_ret - rf))) if np.isfinite(beta) else np.nan
+
+    strategy_sharpe  = float((strategy_ann_ret - rf) / strategy_ann_vol) if strategy_ann_vol > 0 else np.nan
+    benchmark_sharpe = float((benchmark_ann_ret - rf) / benchmark_ann_vol) if benchmark_ann_vol > 0 else np.nan
+    information_ratio = float((strategy_ann_ret - benchmark_ann_ret) / tracking_error) if tracking_error > 0 else np.nan
+    win_rate = float((excess > 0).mean())
+
+    return dict(
+        strategy_total_return=strategy_total_ret,
+        benchmark_total_return=benchmark_total_ret,
+        excess_return=strategy_total_ret - benchmark_total_ret,
+        strategy_annualized_return=strategy_ann_ret,
+        benchmark_annualized_return=benchmark_ann_ret,
+        strategy_annualized_volatility=strategy_ann_vol,
+        benchmark_annualized_volatility=benchmark_ann_vol,
+        alpha=alpha, beta=beta, tracking_error=tracking_error,
+        information_ratio=information_ratio,
+        strategy_sharpe=strategy_sharpe, benchmark_sharpe=benchmark_sharpe,
+        win_rate=win_rate
+    )
 
 # ---------- BACKTEST ----------
 def get_history_yf(tickers, start, end):
@@ -197,18 +345,19 @@ def choose_profile_auto3(hist_prices: pd.DataFrame, prev_profile: str | None = N
 
     # --- Tech momentum overrides (looser) ---
     override_aggr = False
-    if "QQQ" in hist_prices.columns:
-        qqq = hist_prices["QQQ"].dropna()
-        r3_qqq = month_return(qqq, 3)
-        if r3_qqq is not None and np.isfinite(r3_qqq) and r3_qqq >= 0.10:  # was 0.12
-            override_aggr = True
-
-    for lev_t in ("TQQQ", "SOXL"):
-        if lev_t in hist_prices.columns:
-            s = hist_prices[lev_t].dropna()
-            r3_lev = month_return(s, 3)
-            if r3_lev is not None and np.isfinite(r3_lev) and r3_lev >= 0.20:  # was 0.22
+    if ENABLE_TECH_OVERRIDES:
+        if "QQQ" in hist_prices.columns:
+            qqq = hist_prices["QQQ"].dropna()
+            r3_qqq = month_return(qqq, 3)
+            if r3_qqq is not None and np.isfinite(r3_qqq) and r3_qqq >= 0.10:  # was 0.12
                 override_aggr = True
+
+        for lev_t in ("TQQQ", "SOXL"):
+            if lev_t in hist_prices.columns:
+                s = hist_prices[lev_t].dropna()
+                r3_lev = month_return(s, 3)
+                if r3_lev is not None and np.isfinite(r3_lev) and r3_lev >= 0.20:  # was 0.22
+                    override_aggr = True
 
     # --- QQQ SMA200 confirmation ---
     qqq_trend_confirm = False
@@ -227,7 +376,7 @@ def choose_profile_auto3(hist_prices: pd.DataFrame, prev_profile: str | None = N
             desired = "aggressive"
         elif qqq_trend_confirm and any_mom_pos:
             desired = "aggressive"
-        elif (pct_above > (TREND_STRONG + hyst) and any_mom_pos) or (sma100_rising and any_mom_pos):
+        elif (pct_above > (TREND_STRONG + hyst) and any_mom_pos) or (ENABLE_SMA100_SHORTCUT and sma100_rising and any_mom_pos):
             # Either SPY ≥ SMA200 with positive momentum OR SMA100 rising with positive momentum
             desired = "aggressive"
         elif pct_above > (TREND_OK - hyst) and (r3 is not None and r3 >= -0.02):
@@ -270,10 +419,14 @@ def rotation_backtest(profile_name, start, end, freq,
 
     prices = get_history_yf(sorted(tickers), start, end).dropna()
     prices = prices.sort_index()
+    
+    # Get SPY benchmark data for comparison
+    spy_benchmark = prices["SPY"].copy() if "SPY" in prices.columns else None
     ends = period_end_indices(prices, "ME" if freq == "monthly" else "W-FRI")
 
     equity = 10000.0
     curve = []
+    profile_choices = []  # Track profile choices for debug
 
     for i, t_end in enumerate(ends):
         # last trading day on/before period end
@@ -291,6 +444,7 @@ def rotation_backtest(profile_name, start, end, freq,
         # Choose profile at this time
         if profile_name == "auto":
             chosen, last_spy, sma200, r1, r3 = choose_profile_auto3(hist, prev_profile=None)
+            profile_choices.append(chosen)  # Track for debug
             cfg = PROFILES[chosen]
         else:
             chosen = profile_name
@@ -310,7 +464,10 @@ def rotation_backtest(profile_name, start, end, freq,
             continue
 
         # Compute scores in the chosen universe
-        scores = {t: blended_momentum(hist[t].dropna(), months) for t in universe}
+        if USE_ENHANCED_MOMENTUM:
+            scores = {t: enhanced_momentum(hist[t].dropna(), months) for t in universe}
+        else:
+            scores = {t: blended_momentum(hist[t].dropna(), months) for t in universe}
         ranked = sorted(scores.items(), key=lambda kv: (kv[1] if kv[1]==kv[1] else -9e9), reverse=True)
         picks = [t for t,s in ranked if s==s and s > abs_thresh][:top_n]
         targets = picks if picks else [risk_off]
@@ -336,7 +493,27 @@ def rotation_backtest(profile_name, start, end, freq,
             curve.append((t1, equity))
             continue
 
-        ret = float(p1 / p0 - 1.0)
+        # Apply volatility-adjusted sizing if enabled
+        if ENABLE_VOLATILITY_SIZING and len(targets) > 0:
+            # Calculate average volatility of selected assets
+            total_vol_adjustment = 0
+            for ticker in targets:
+                if ticker in hist.columns:
+                    ticker_prices = hist[ticker].dropna()
+                    vol_adjustment = calculate_volatility_adjusted_size(
+                        ticker_prices, 1.0, VOLATILITY_LOOKBACK
+                    )
+                    total_vol_adjustment += vol_adjustment
+            
+            if total_vol_adjustment > 0:
+                avg_vol_adjustment = total_vol_adjustment / len(targets)
+                # Apply the adjustment to the return
+                ret = float(p1 / p0 - 1.0) * avg_vol_adjustment
+            else:
+                ret = float(p1 / p0 - 1.0)
+        else:
+            ret = float(p1 / p0 - 1.0)
+        
         equity *= (1.0 + ret)
         curve.append((t1, equity))
 
@@ -344,6 +521,17 @@ def rotation_backtest(profile_name, start, end, freq,
     daily = curve["equity"].pct_change().dropna()
     sharpe = float(np.sqrt(252) * (daily.mean() / (daily.std() + 1e-12))) if len(daily) else 0.0
     max_dd = float((curve["equity"] / curve["equity"].cummax() - 1).min()) if len(curve) else 0.0
+    
+    # Calculate benchmark metrics if SPY data is available
+    benchmark_metrics = {}
+    if spy_benchmark is not None and len(curve) > 1:
+        spy_aligned = spy_benchmark.reindex(curve.index, method='ffill').dropna()
+        if len(spy_aligned) > 1:
+            spy_ret = spy_aligned.pct_change().dropna()
+            strategy_ret = period_ret.loc[spy_ret.index]  # align just in case
+            benchmark_metrics = calculate_benchmark_metrics(strategy_ret, spy_ret, periods_per_year_from_freq(freq))
+
+    
     stats = {
         "start": str(curve.index[0].date()) if len(curve) else start,
         "end":   str(curve.index[-1].date()) if len(curve) else (end or str(pd.Timestamp.today().date())),
@@ -353,7 +541,12 @@ def rotation_backtest(profile_name, start, end, freq,
         "max_drawdown": max_dd,
         "freq": freq,
         "profile": profile_name,
+        "profile_choices": profile_choices,  # Include for debug
     }
+    
+    # Add benchmark metrics to stats
+    stats.update(benchmark_metrics)
+    
     return curve, stats
 
 def run_threshold_sweep(vals, start, end, freq):
@@ -361,20 +554,32 @@ def run_threshold_sweep(vals, start, end, freq):
     Sweep TREND_STRONG over 'vals' (list of floats), run auto backtests,
     and print/save a results table.
     """
-    global TREND_STRONG
+    global TREND_STRONG, ENABLE_SMA100_SHORTCUT, ENABLE_TECH_OVERRIDES
     results = []
 
-    # Keep original to restore afterwards
+    # Keep original values to restore afterwards
     original_trend_strong = TREND_STRONG
+    original_sma100 = ENABLE_SMA100_SHORTCUT
+    original_over = ENABLE_TECH_OVERRIDES
 
     try:
+        # Isolate TREND_STRONG effect by disabling other gates
+        ENABLE_SMA100_SHORTCUT = False
+        ENABLE_TECH_OVERRIDES = False
+
         for v in vals:
             TREND_STRONG = float(v)
             curve, stats = rotation_backtest(
                 "auto", start=start, end=end, freq=freq,
                 topn_override=None, months_override=None, abs_override=None
             )
-            results.append({
+            
+            # Debug: Print profile choice counts
+            if stats["profile_choices"]:
+                choice_counts = pd.Series(stats["profile_choices"]).value_counts()
+                print(f"TREND_STRONG={v}: Profile counts: {dict(choice_counts)}")
+            
+            result_row = {
                 "trend_strong": v,
                 "start": stats["start"],
                 "end": stats["end"],
@@ -383,12 +588,43 @@ def run_threshold_sweep(vals, start, end, freq):
                 "return_pct": stats["return_pct"],
                 "sharpe_naive": stats["sharpe_naive"],
                 "max_drawdown": stats["max_drawdown"],
-            })
+            }
+            
+            # Add key benchmark metrics if available
+            if "excess_return" in stats:
+                result_row.update({
+                    "excess_return": stats["excess_return"],
+                    "alpha": stats.get("alpha", np.nan),
+                    "beta": stats.get("beta", np.nan),
+                    "information_ratio": stats.get("information_ratio", np.nan),
+                    "win_rate": stats.get("win_rate", np.nan),
+                })
+            
+            results.append(result_row)
 
         df = pd.DataFrame(results)
         df_sorted = df.sort_values(by="return_pct", ascending=False)
-        print("\n=== Threshold Sweep (TREND_STRONG) ===")
-        print(df_sorted.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+        print("\n=== Threshold Sweep (TREND_STRONG) - Isolated ===")
+        print("Note: SMA100 shortcut and tech overrides disabled to isolate TREND_STRONG effect")
+        
+        # Format the output nicely
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
+        pd.set_option('display.max_colwidth', None)
+        
+        # Format percentage columns
+        PCT_KEYS = {"return_pct", "excess_return", "alpha", "win_rate", "tracking_error"}
+        for col in PCT_KEYS:
+            if col in df_sorted.columns:
+                df_sorted[col] = df_sorted[col].apply(lambda x: f"{x:.2%}" if pd.notna(x) else "N/A")
+        
+        # Format decimal columns
+        DEC_KEYS = {"sharpe_naive", "beta", "information_ratio"}
+        for col in DEC_KEYS:
+            if col in df_sorted.columns:
+                df_sorted[col] = df_sorted[col].apply(lambda x: f"{x:.3f}" if pd.notna(x) else "N/A")
+        
+        print(df_sorted.to_string(index=False))
 
         # Save for later
         out_csv = f"sweep_trend_strong_{freq}.csv"
@@ -397,6 +633,8 @@ def run_threshold_sweep(vals, start, end, freq):
         return df_sorted
     finally:
         TREND_STRONG = original_trend_strong
+        ENABLE_SMA100_SHORTCUT = original_sma100
+        ENABLE_TECH_OVERRIDES = original_over
 
 
 # ---------- LIVE ----------
@@ -518,7 +756,10 @@ def liquidate_others(api, keep_symbols, allow_after_hours=False):
                 print("Close error:", sym, e)
 
 def compute_picks(closes: pd.DataFrame):
-    scores = {t: blended_momentum(closes[t].dropna(), LOOKBACK_M) for t in UNIVERSE}
+    if USE_ENHANCED_MOMENTUM:
+        scores = {t: enhanced_momentum(closes[t].dropna(), LOOKBACK_M) for t in UNIVERSE}
+    else:
+        scores = {t: blended_momentum(closes[t].dropna(), LOOKBACK_M) for t in UNIVERSE}
     ranked = sorted(scores.items(), key=lambda kv: (kv[1] if kv[1]==kv[1] else -9e9), reverse=True)
     picks = [t for t,s in ranked if s==s and s > ABS_THRESH][:TOP_N]
     return (picks if picks else [RISK_OFF]), scores
@@ -666,6 +907,16 @@ def main():
     p = argparse.ArgumentParser(description="Momentum Rotation (monthly or weekly): backtest or live.")
     p.add_argument("--profile", choices=list(PROFILES.keys()) + ["auto"], default="balanced",
                    help="Parameter preset: conservative | balanced | aggressive | auto (auto-switches among the three)")
+    p.add_argument("--trend-strong", type=float, default=None,
+                   help="Override TREND_STRONG (e.g., 0.03 means SPY must be 3% above SMA200 for 'strong').")
+    p.add_argument("--enhanced-momentum", action="store_true",
+                   help="Use enhanced momentum calculation (volatility-adjusted)")
+    p.add_argument("--simple-momentum", action="store_true",
+                   help="Use simple momentum calculation (original method)")
+    p.add_argument("--volatility-sizing", action="store_true",
+                   help="Enable volatility-based position sizing")
+    p.add_argument("--no-volatility-sizing", action="store_true",
+                   help="Disable volatility-based position sizing")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     bt = sub.add_parser("backtest", help="Run local backtest with yfinance.")
@@ -691,6 +942,22 @@ def main():
                        help="Comma separated list of TREND_STRONG values to test (e.g., '0,0.02,0.03,0.05')")
 
     args = p.parse_args()
+
+    # Apply trend-strong override if provided (except for sweep which uses --vals)
+    if args.trend_strong is not None and args.cmd != "sweep":
+        globals()["TREND_STRONG"] = float(args.trend_strong)
+    
+    # Apply momentum calculation override if provided
+    if args.enhanced_momentum:
+        globals()["USE_ENHANCED_MOMENTUM"] = True
+    elif args.simple_momentum:
+        globals()["USE_ENHANCED_MOMENTUM"] = False
+    
+    # Apply volatility sizing override if provided
+    if args.volatility_sizing:
+        globals()["ENABLE_VOLATILITY_SIZING"] = True
+    elif args.no_volatility_sizing:
+        globals()["ENABLE_VOLATILITY_SIZING"] = False
 
     # ---------- SWEEP ----------
     if args.cmd == "sweep":
@@ -727,11 +994,40 @@ def main():
             curve, stats = rotation_backtest(args.profile, start=args.start, end=args.end, freq=args.freq)
 
         print("Backtest Stats:")
+        # Define formatting groups
+        PCT_KEYS = {"return_pct", "excess_return", "alpha", "win_rate", "tracking_error"}
+        DEC_KEYS = {"sharpe_naive", "strategy_sharpe", "benchmark_sharpe", "information_ratio", "beta"}
+        
         for k, v in stats.items():
-            print(f" - {k}: {v}")
+            if k == "profile_choices":  # Skip debug info
+                continue
+            if isinstance(v, float):
+                if k in PCT_KEYS:
+                    print(f" - {k}: {v:.2%}")
+                elif k in DEC_KEYS:
+                    print(f" - {k}: {v:.3f}")
+                else:
+                    print(f" - {k}: {v:.2f}")
+            else:
+                print(f" - {k}: {v}")
+        
+        # Enhanced benchmark reporting
+        if "excess_return" in stats:
+            print("\n=== Benchmark Comparison (vs SPY) ===")
+            print(f"Strategy Total Return: {stats.get('strategy_total_return', 0):.2%}")
+            print(f"SPY Total Return:      {stats.get('benchmark_total_return', 0):.2%}")
+            print(f"Excess Return:         {stats.get('excess_return', 0):.2%}")
+            print(f"Alpha:                 {stats.get('alpha', 0):.2%}")
+            print(f"Beta:                  {stats.get('beta', 0):.3f}")
+            print(f"Information Ratio:     {stats.get('information_ratio', 0):.3f}")
+            print(f"Tracking Error:        {stats.get('tracking_error', 0):.2%}")
+            print(f"Win Rate:              {stats.get('win_rate', 0):.2%}")
+            print(f"Strategy Sharpe:       {stats.get('strategy_sharpe', 0):.3f}")
+            print(f"SPY Sharpe:            {stats.get('benchmark_sharpe', 0):.3f}")
+        
         out = f"equity_{args.freq}.csv"
         curve.to_csv(out)
-        print(f"Saved equity curve -> {out}")
+        print(f"\nSaved equity curve -> {out}")
         return
 
     # ---------- LIVE ----------

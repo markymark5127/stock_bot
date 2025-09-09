@@ -30,9 +30,9 @@ TZ = "America/New_York"
 # --- Enhancements toggles ---
 RELATIVE_MOM_BENCH = "SPY"   # None or "SPY"
 SKIP_MONTH = True            # use 12-1 momentum if True (skip most recent month)
-VOL_TARGET_ANNUAL = 0.12     # set None to disable vol targeting
+VOL_TARGET_ANNUAL = 0.16     # set None to disable vol targeting
 VOL_LOOKBACK_DAYS = 20
-VOL_MAX_LEVERAGE = 1.5       # cap risky sleeve scaling
+VOL_MAX_LEVERAGE = 2.0       # cap risky sleeve scaling
 REBALANCE_BAND = 0.10        # 10% band; set 0 to disable
 COST_BPS = 5                 # per-trade cost in basis points (e.g., 5 = 0.05%)
 
@@ -389,11 +389,23 @@ def rotation_backtest(profile_name, start, end, freq,
                 continue
             if s <= abs_thresh:
                 continue
-            if RELATIVE_MOM_BENCH and np.isfinite(rel_gate) and s <= rel_gate:
+            # Only gate *non-SPY* vs SPY
+            if RELATIVE_MOM_BENCH and t != RELATIVE_MOM_BENCH and np.isfinite(rel_gate) and s <= rel_gate:
                 continue
             qualified.append((t, s))
 
+
         picks = [t for t, _ in qualified[:top_n]]
+
+        # --- NEW: default to SPY when its trend is positive ---
+        if not picks and "SPY" in hist.columns:
+            spy = hist["SPY"].dropna()
+            spy_ok = False
+            if len(spy) >= 200:
+                spy_ok = (spy.iloc[-1] / spy.rolling(200).mean().iloc[-1] - 1.0) > 0 and month_return(spy, 3) > 0
+            if spy_ok:
+                picks = ["SPY"]
+
 
         # Risk-off: best-of basket if available, otherwise profile's RISK_OFF
         risk_cands = [r for r in (RISK_OFF_BASKET + ([risk_off] if risk_off else [])) if r in hist.columns]
@@ -433,7 +445,6 @@ def rotation_backtest(profile_name, start, end, freq,
         # Volatility targeting on risky sleeve
         w_risky = 1.0
         if VOL_TARGET_ANNUAL is not None and targets:
-            # realized vol of risky sleeve over last VOL_LOOKBACK_DAYS (equal weight)
             look_idx = prices.index[prices.index <= t0]
             look_idx = look_idx[-(VOL_LOOKBACK_DAYS+1):]
             if len(look_idx) >= 2:
@@ -443,18 +454,24 @@ def rotation_backtest(profile_name, start, end, freq,
                     ew_ret = sub_ret.mean(axis=1)
                     ann_vol = float(ew_ret.std() * np.sqrt(252)) if len(ew_ret) else np.nan
                     if np.isfinite(ann_vol) and ann_vol > 1e-8:
-                        w_risky = min(VOL_TARGET_ANNUAL / ann_vol, VOL_MAX_LEVERAGE)
-                        w_risky = max(0.0, w_risky)
-        w_risky = float(w_risky)
-        w_safe = max(0.0, 1.0 - min(1.0, w_risky))
+                        ratio = VOL_TARGET_ANNUAL / ann_vol
+                        # Only lever up when calm; never de-lever below 1.0
+                        if ratio > 1.0:
+                            w_risky = min(ratio, VOL_MAX_LEVERAGE)
+                        else:
+                            w_risky = 1.0
+
+        # if leveraging, no "safe" sleeve; otherwise fill remaining with risk-off
+        w_safe = 0.0 if w_risky > 1.0 else (1.0 - w_risky)
+
 
         period_ret = w_risky * risky_ret + w_safe * riskoff_ret
 
         # Rebalance band & rough costs
-        if not (REBALANCE_BAND and not changed and abs(period_ret) < (REBALANCE_BAND / 2)):
-            legs = 2 if changed else 1
-            cost = (COST_BPS / 10000.0) * legs
-            period_ret -= cost
+        if changed and COST_BPS:
+            n_changed = len(set(prev_targets) ^ set(targets))  # symmetric diff
+            legs = max(1, n_changed) * 2                      # exit+enter per changed name
+            period_ret -= (COST_BPS / 10000.0) * legs
 
         equity *= (1.0 + period_ret)
         prev_targets = targets
@@ -669,10 +686,21 @@ def compute_picks(closes: pd.DataFrame):
     for t, s in ranked:
         if not np.isfinite(s): continue
         if s <= ABS_THRESH: continue
-        if RELATIVE_MOM_BENCH and np.isfinite(rel_gate) and s <= rel_gate: continue
+        if RELATIVE_MOM_BENCH and t != RELATIVE_MOM_BENCH and np.isfinite(rel_gate) and s <= rel_gate: continue 
         qualified.append((t, s))
 
+
     picks = [t for t, _ in qualified[:TOP_N]]
+
+    # NEW: SPY fallback
+    if not picks and "SPY" in closes.columns:
+        spy = closes["SPY"].dropna()
+        spy_ok = False
+        if len(spy) >= 200:
+            spy_ok = (spy.iloc[-1] / spy.rolling(200).mean().iloc[-1] - 1.0) > 0 and month_return(spy, 3) > 0
+        if spy_ok:
+            picks = ["SPY"]
+
 
     # best-of risk-off basket
     risk_cands = [r for r in (RISK_OFF_BASKET + [RISK_OFF]) if r in closes.columns]

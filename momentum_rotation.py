@@ -29,7 +29,7 @@ TZ = "America/New_York"
 
 # --- Enhancements toggles ---
 RELATIVE_MOM_BENCH = "SPY"   # None or "SPY"
-SKIP_MONTH = True            # use 12-1 momentum if True (skip most recent month)
+SKIP_MONTH = "auto"          # True | False | "auto"
 VOL_TARGET_ANNUAL = 0.16     # set None to disable vol targeting
 VOL_LOOKBACK_DAYS = 20
 VOL_MAX_LEVERAGE = 2.0       # cap risky sleeve scaling
@@ -161,32 +161,60 @@ def series_sharpe_dd(curve: pd.DataFrame, freq: str):
     return sharpe, max_dd
 
 def blended_momentum(prices: pd.Series, months_list, skip_month=SKIP_MONTH):
+    """
+    Average of multi-horizon momentum in months_list.
+    If skip_month is True or 'auto', measure (m+1)->(1) months ago (12-1 momentum).
+    If 'auto', skip only when price < SMA200 (bearish regime).
+    """
     if not months_list:
         return np.nan
+
+    s = prices.dropna().astype(float)
+    if s.empty:
+        return np.nan
+
+    # --- Resolve skip-month if set to "auto" ---
+    if isinstance(skip_month, str) and skip_month.lower() == "auto":
+        if len(s) >= 200:
+            sma200_last = s.rolling(200).mean().iloc[-1]
+            skip_month = bool(np.isfinite(sma200_last) and s.iloc[-1] < sma200_last)
+        else:
+            # conservative until enough history
+            skip_month = True
+
+    # Need enough data to evaluate the longest horizon (plus 1 month if skipping)
     max_m = max(months_list) + (1 if skip_month else 0)
-    min_needed = 22 * max_m + 5
-    s = prices.dropna()
+    min_needed = 22 * max_m + 5  # ~22 trading days per month + buffer
     if len(s) < min_needed:
         return np.nan
 
-    def ret_months(m):
-        # if skip_month: we measure from (m+1) months ago to 1 month ago
+    def ret_months(m: int):
+        # end/start anchors depend on skip-month regime
         if skip_month:
             end_t = s.index[-1] - pd.DateOffset(months=1)
-            start_t = s.index[-1] - pd.DateOffset(months=m+1)
+            start_t = s.index[-1] - pd.DateOffset(months=m + 1)
         else:
             end_t = s.index[-1]
             start_t = s.index[-1] - pd.DateOffset(months=m)
+
         i0 = s.index.searchsorted(start_t)
         i1 = s.index.searchsorted(end_t)
-        if i0 <= 0 or i1 <= 0 or i0 >= len(s) or i1 >= len(s) or i1 <= i0:
+        # clamp / sanity checks
+        if i1 >= len(s): 
+            i1 = len(s) - 1
+        if i0 < 0 or i0 >= len(s) or i1 <= i0:
             return np.nan
+
         p0, p1 = float(s.iloc[i0]), float(s.iloc[i1])
-        return (p1 / p0 - 1.0) if p0 > 0 else np.nan
+        if p0 <= 0:
+            return np.nan
+        return (p1 / p0 - 1.0)
 
     rets = [ret_months(m) for m in months_list]
     rets = [r for r in rets if np.isfinite(r)]
     return float(np.nanmean(rets)) if rets else np.nan
+
+
 
 def sma(series: pd.Series, window=200):
     s = series.dropna()

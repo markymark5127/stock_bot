@@ -61,17 +61,17 @@ jobs:
         run: |
           [ -f rotation_state.json ] || echo '{}' > rotation_state.json
 
-      - name: Run rotation (weekly, one-shot, AUTO profile)
+      - name: Run rotation (monthly, one-shot, AUTO profile)
         run: |
-          python momentum_rotation.py live --profile auto --freq weekly --once
+          python momentum_rotation.py --profile auto live --freq monthly --once
           # For monthly instead:
-          # python momentum_rotation.py live --profile auto --freq monthly --once
+          # python momentum_rotation.py --profile auto live --freq monthly --once
           #
           # For off-hours testing (queue AH orders):
-          # python momentum_rotation.py live --profile auto --freq weekly --once --after-hours
+          # python momentum_rotation.py --profile auto live --freq weekly --once --after-hours
           #
           # Or ignore the clock entirely (testing only):
-          # python momentum_rotation.py live --profile auto --freq weekly --once --force
+          # python momentum_rotation.py --profile auto live --freq weekly --once --force
 
       # Save updated state for next run
       - name: Save state
